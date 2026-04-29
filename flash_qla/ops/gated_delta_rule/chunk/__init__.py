@@ -2,15 +2,18 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 import torch
-import tilelang
 
 from flash_qla.utils import l2norm
 from flash_qla.ops.utils import chunk_local_cumsum, group_reduce_vector
+from . import tilelang_compat as _tilelang_compat  # noqa: F401
+from .arch import is_sm12x, is_sm90
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+if is_sm90():
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
+elif is_sm12x():
+    from .blackwell import fused_gdr_fwd, kkt_solve
 else:
-    raise ValueError("FlashQLA now support sm90 only.")
+    raise ValueError("FlashQLA now supports sm90 and sm12x only.")
 from .cp_context import intra_card_cp_preprocess
 
 
@@ -33,6 +36,8 @@ def chunk_gated_delta_rule_fwd(
         b=beta,
         cu_seqlens=cu_seqlens,
     )
+    cp_seq_map = None
+    raw_cu_seqlens = None
     if auto_cp:
         initial_state, cu_seqlens, cp_seq_map, raw_cu_seqlens = (
             intra_card_cp_preprocess(
@@ -77,6 +82,12 @@ def chunk_gated_delta_rule_bwd(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
 ):
+    if is_sm12x():
+        raise NotImplementedError(
+            "FlashQLA sm12x backward requires a split TileLang kernel; "
+            "the Hopper fused backward kernel exceeds sm120/sm121 shared memory limits."
+        )
+
     h, _, _ = fused_gdr_h(
         k=k,
         v=v,
@@ -124,6 +135,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
     ):
         q_orig = q
         k_orig = k

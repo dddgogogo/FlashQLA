@@ -7,11 +7,15 @@ import torch
 import tilelang
 
 from flash_qla.utils import tensor_cache
+from . import tilelang_compat as _tilelang_compat  # noqa: F401
+from .arch import is_sm12x, is_sm90
 
-if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
+if is_sm90():
     from .hopper import get_warmup_chunks, fused_gdr_h, correct_initial_states
+elif is_sm12x():
+    from .blackwell import get_warmup_chunks, fused_gdr_h, correct_initial_states
 else:
-    raise ValueError("FlashQLA now support sm90 only.")
+    raise ValueError("FlashQLA now supports sm90 and sm12x only.")
 
 
 MULTI_PROCESSOR_COUNT = torch.cuda.get_device_properties().multi_processor_count
@@ -140,6 +144,8 @@ def intra_card_cp_preprocess(
         chunk_size=chunk_size,
         threshold=warmup_threshold,
     )  # [cp_batch_size, num_v_heads]
+    if is_sm12x() and fallback_mask.any().item():
+        return raw_h0, raw_cu_seqlens, None, None
     _, ht, mt = fused_gdr_h(
         k=k,
         v=v,
