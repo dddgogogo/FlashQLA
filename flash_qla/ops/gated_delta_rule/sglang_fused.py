@@ -1385,7 +1385,7 @@ def fused_sigmoid_gating_delta_rule_update(
         and not has_tree
         and not disable_state_update
     ):
-        block_DV = 32
+        block_DV = head_v_dim if num_sequences <= 4 else 32
     else:
         block_DV = min(128, 1 << (head_v_dim - 1).bit_length())
     if (
@@ -1438,7 +1438,7 @@ def fused_sigmoid_gating_delta_rule_update(
     if use_regular_kernel:
         if regular_tokens_per_seq is None:
             raise ValueError("regular SGLang fused kernel requires equal sequence lengths")
-        if block_DV in (8, 16, 32, 64):
+        if block_DV in (4, 8, 16, 32, 64):
             kernel = tilelang_sglang_fused_gdn_regular_bv32_warp(
                 H=num_key_heads,
                 HV=num_value_heads,
