@@ -208,8 +208,742 @@ def tilelang_sglang_fused_gdn(
     return tilelang_sglang_fused_gdn_kernel
 
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_sglang_fused_gdn_regular(
+    H,
+    HV,
+    DK,
+    DV,
+    tokens_per_seq,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+    disable_state_update,
+    cache_intermediate_states,
+    has_tree_attention,
+    block_DV: int = 128,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+    cache_steps = T.dynamic("cache_steps")
+    num_value_tiles = tilelang.cdiv(DV, block_DV)
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+    intermediate_shape = (num_sequences, cache_steps, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_sglang_fused_gdn_regular_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        intermediate_states_buffer: T.Tensor(intermediate_shape, dtype=state_dtype),
+        intermediate_state_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        retrieve_parent_token: T.Tensor((num_sequences, cache_steps), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV * num_value_tiles, threads=128) as (bid,):
+            bnh = bid // num_value_tiles
+            bv = bid % num_value_tiles
+            bn = bnh // HV
+            bh = bnh % HV
+            bhq = bh // (HV // H)
+
+            seq_start = T.alloc_var("int32")
+            state_idx = T.alloc_var("int32")
+            cache_idx = T.alloc_var("int32")
+
+            seq_start = bn * tokens_per_seq
+            state_idx = h0_indices[bn]
+            cache_idx = -1
+            if cache_intermediate_states:
+                cache_idx = intermediate_state_indices[bn]
+
+            h_fragment = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
+            q_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            k_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            v_fragment = T.alloc_fragment((block_DV,), dtype=accum_dtype)
+            kv_fragment = T.alloc_fragment((block_DV,), dtype=accum_dtype)
+            o_fragment = T.alloc_fragment((block_DV,), dtype=accum_dtype)
+            reduce_fragment = T.alloc_fragment((DK, block_DV), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            parent_step = T.alloc_fragment((1,), dtype=indices_dtype)
+            cache_barrier = T.alloc_barrier(arrive_count=128)
+
+            T.clear(h_fragment)
+            if state_idx >= 0:
+                for jk, jv in T.Parallel(DK, block_DV):
+                    if bv * block_DV + jv < DV:
+                        h_fragment[jk, jv] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, jk
+                        ]
+
+            for step in T.serial(tokens_per_seq):
+                if has_tree_attention:
+                    if step != 0 and cache_idx >= 0:
+                        parent_step[0] = retrieve_parent_token[bn, step]
+                        for jk, jv in T.Parallel(DK, block_DV):
+                            if bv * block_DV + jv < DV:
+                                h_fragment[jk, jv] = intermediate_states_buffer[
+                                    cache_idx,
+                                    parent_step[0],
+                                    bh,
+                                    bv * block_DV + jv,
+                                    jk,
+                                ]
+
+                token_idx = seq_start + step
+
+                for jk in T.Parallel(DK):
+                    q_fragment[jk] = q[0, token_idx, bhq, jk]
+                    k_fragment[jk] = k[0, token_idx, bhq, jk]
+
+                if use_qk_l2norm_in_kernel:
+                    q_norm[0] = 0.0
+                    k_norm[0] = 0.0
+                    for jk in T.serial(DK):
+                        q_norm[0] += q_fragment[jk] * q_fragment[jk]
+                        k_norm[0] += k_fragment[jk] * k_fragment[jk]
+                    q_norm[0] = T.rsqrt(q_norm[0] + 1e-6)
+                    k_norm[0] = T.rsqrt(k_norm[0] + 1e-6)
+                    for jk in T.Parallel(DK):
+                        q_fragment[jk] *= q_norm[0]
+                        k_fragment[jk] *= k_norm[0]
+
+                for jk in T.Parallel(DK):
+                    q_fragment[jk] *= scale
+
+                a_raw[0] = a[0, token_idx, bh]
+                b_raw[0] = b[0, token_idx, bh]
+                x[0] = a_raw[0] + dt_bias[bh]
+                beta_x[0] = softplus_beta * x[0]
+                if beta_x[0] <= softplus_threshold:
+                    softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+                else:
+                    softplus_x[0] = x[0]
+                exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+                beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
+
+                for jk, jv in T.Parallel(DK, block_DV):
+                    h_fragment[jk, jv] *= exp_g[0]
+
+                for jk, jv in T.Parallel(DK, block_DV):
+                    if bv * block_DV + jv < DV:
+                        reduce_fragment[jk, jv] = h_fragment[jk, jv] * k_fragment[jk]
+                    else:
+                        reduce_fragment[jk, jv] = 0.0
+                T.reduce_sum(reduce_fragment, kv_fragment, dim=0, clear=True)
+
+                for jv in T.Parallel(block_DV):
+                    if bv * block_DV + jv < DV:
+                        v_fragment[jv] = v[0, token_idx, bh, bv * block_DV + jv]
+                        v_fragment[jv] = (v_fragment[jv] - kv_fragment[jv]) * beta[0]
+
+                for jk, jv in T.Parallel(DK, block_DV):
+                    if bv * block_DV + jv < DV:
+                        h_fragment[jk, jv] += k_fragment[jk] * v_fragment[jv]
+
+                for jk, jv in T.Parallel(DK, block_DV):
+                    if bv * block_DV + jv < DV:
+                        reduce_fragment[jk, jv] = h_fragment[jk, jv] * q_fragment[jk]
+                    else:
+                        reduce_fragment[jk, jv] = 0.0
+                T.reduce_sum(reduce_fragment, o_fragment, dim=0, clear=True)
+
+                for jv in T.Parallel(block_DV):
+                    if bv * block_DV + jv < DV:
+                        o[0, token_idx, bh, bv * block_DV + jv] = o_fragment[jv]
+
+                if cache_intermediate_states:
+                    if cache_idx >= 0:
+                        for jk, jv in T.Parallel(DK, block_DV):
+                            if bv * block_DV + jv < DV:
+                                intermediate_states_buffer[
+                                    cache_idx, step, bh, bv * block_DV + jv, jk
+                                ] = h_fragment[jk, jv]
+                    if has_tree_attention:
+                        T.barrier_arrive(cache_barrier)
+                        T.barrier_wait(cache_barrier, step % 2)
+
+            if not disable_state_update:
+                if state_idx >= 0:
+                    for jk, jv in T.Parallel(DK, block_DV):
+                        if bv * block_DV + jv < DV:
+                            h0_source[state_idx, bh, bv * block_DV + jv, jk] = (
+                                h_fragment[jk, jv]
+                            )
+
+    return tilelang_sglang_fused_gdn_regular_kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_sglang_fused_gdn_regular_fullv(
+    H,
+    HV,
+    DK,
+    DV,
+    tokens_per_seq,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+    disable_state_update,
+    cache_intermediate_states,
+    has_tree_attention,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+    cache_steps = T.dynamic("cache_steps")
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+    intermediate_shape = (num_sequences, cache_steps, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_sglang_fused_gdn_regular_fullv_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        intermediate_states_buffer: T.Tensor(intermediate_shape, dtype=state_dtype),
+        intermediate_state_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        retrieve_parent_token: T.Tensor((num_sequences, cache_steps), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV, threads=128) as (bid,):
+            bn = bid // HV
+            bh = bid % HV
+            bhq = bh // (HV // H)
+
+            seq_start = T.alloc_var("int32")
+            state_idx = T.alloc_var("int32")
+            cache_idx = T.alloc_var("int32")
+
+            seq_start = bn * tokens_per_seq
+            state_idx = h0_indices[bn]
+            cache_idx = -1
+            if cache_intermediate_states:
+                cache_idx = intermediate_state_indices[bn]
+
+            h_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
+            q_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            k_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            v_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            kv_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            o_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            reduce_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            parent_step = T.alloc_fragment((1,), dtype=indices_dtype)
+            cache_barrier = T.alloc_barrier(arrive_count=128)
+
+            T.clear(h_fragment)
+            if state_idx >= 0:
+                for jk, jv in T.Parallel(DK, DV):
+                    h_fragment[jk, jv] = h0_source[state_idx, bh, jv, jk]
+
+            for step in T.serial(tokens_per_seq):
+                if has_tree_attention:
+                    if step != 0 and cache_idx >= 0:
+                        parent_step[0] = retrieve_parent_token[bn, step]
+                        for jk, jv in T.Parallel(DK, DV):
+                            h_fragment[jk, jv] = intermediate_states_buffer[
+                                cache_idx, parent_step[0], bh, jv, jk
+                            ]
+
+                token_idx = seq_start + step
+
+                for jk in T.Parallel(DK):
+                    q_fragment[jk] = q[0, token_idx, bhq, jk]
+                    k_fragment[jk] = k[0, token_idx, bhq, jk]
+
+                if use_qk_l2norm_in_kernel:
+                    q_norm[0] = 0.0
+                    k_norm[0] = 0.0
+                    for jk in T.serial(DK):
+                        q_norm[0] += q_fragment[jk] * q_fragment[jk]
+                        k_norm[0] += k_fragment[jk] * k_fragment[jk]
+                    q_norm[0] = T.rsqrt(q_norm[0] + 1e-6)
+                    k_norm[0] = T.rsqrt(k_norm[0] + 1e-6)
+                    for jk in T.Parallel(DK):
+                        q_fragment[jk] *= q_norm[0]
+                        k_fragment[jk] *= k_norm[0]
+
+                for jk in T.Parallel(DK):
+                    q_fragment[jk] *= scale
+
+                a_raw[0] = a[0, token_idx, bh]
+                b_raw[0] = b[0, token_idx, bh]
+                x[0] = a_raw[0] + dt_bias[bh]
+                beta_x[0] = softplus_beta * x[0]
+                if beta_x[0] <= softplus_threshold:
+                    softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+                else:
+                    softplus_x[0] = x[0]
+                exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+                beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
+
+                for jk, jv in T.Parallel(DK, DV):
+                    h_fragment[jk, jv] *= exp_g[0]
+
+                for jk, jv in T.Parallel(DK, DV):
+                    reduce_fragment[jk, jv] = h_fragment[jk, jv] * k_fragment[jk]
+                T.reduce_sum(reduce_fragment, kv_fragment, dim=0, clear=True)
+
+                for jv in T.Parallel(DV):
+                    v_fragment[jv] = v[0, token_idx, bh, jv]
+                    v_fragment[jv] = (v_fragment[jv] - kv_fragment[jv]) * beta[0]
+
+                for jk, jv in T.Parallel(DK, DV):
+                    h_fragment[jk, jv] += k_fragment[jk] * v_fragment[jv]
+
+                for jk, jv in T.Parallel(DK, DV):
+                    reduce_fragment[jk, jv] = h_fragment[jk, jv] * q_fragment[jk]
+                T.reduce_sum(reduce_fragment, o_fragment, dim=0, clear=True)
+
+                for jv in T.Parallel(DV):
+                    o[0, token_idx, bh, jv] = o_fragment[jv]
+
+                if cache_intermediate_states:
+                    if cache_idx >= 0:
+                        for jk, jv in T.Parallel(DK, DV):
+                            intermediate_states_buffer[cache_idx, step, bh, jv, jk] = (
+                                h_fragment[jk, jv]
+                            )
+                    if has_tree_attention:
+                        T.barrier_arrive(cache_barrier)
+                        T.barrier_wait(cache_barrier, step % 2)
+
+            if not disable_state_update:
+                if state_idx >= 0:
+                    for jk, jv in T.Parallel(DK, DV):
+                        h0_source[state_idx, bh, jv, jk] = h_fragment[jk, jv]
+
+    return tilelang_sglang_fused_gdn_regular_fullv_kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_sglang_fused_gdn_decode_fullv(
+    H,
+    HV,
+    DK,
+    DV,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_sglang_fused_gdn_decode_fullv_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV, threads=128) as (bid,):
+            bn = bid // HV
+            bh = bid % HV
+            bhq = bh // (HV // H)
+
+            state_idx = T.alloc_var("int32")
+            state_idx = h0_indices[bn]
+
+            h_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
+            q_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            k_fragment = T.alloc_fragment((DK,), dtype=accum_dtype)
+            v_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            kv_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            o_fragment = T.alloc_fragment((DV,), dtype=accum_dtype)
+            reduce_fragment = T.alloc_fragment((DK, DV), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((1,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
+
+            T.clear(h_fragment)
+            if state_idx >= 0:
+                for jk, jv in T.Parallel(DK, DV):
+                    h_fragment[jk, jv] = h0_source[state_idx, bh, jv, jk]
+
+            for jk in T.Parallel(DK):
+                q_fragment[jk] = q[0, bn, bhq, jk]
+                k_fragment[jk] = k[0, bn, bhq, jk]
+
+            if use_qk_l2norm_in_kernel:
+                q_norm[0] = 0.0
+                k_norm[0] = 0.0
+                for jk in T.serial(DK):
+                    q_norm[0] += q_fragment[jk] * q_fragment[jk]
+                    k_norm[0] += k_fragment[jk] * k_fragment[jk]
+                q_norm[0] = T.rsqrt(q_norm[0] + 1e-6)
+                k_norm[0] = T.rsqrt(k_norm[0] + 1e-6)
+                for jk in T.Parallel(DK):
+                    q_fragment[jk] *= q_norm[0]
+                    k_fragment[jk] *= k_norm[0]
+
+            for jk in T.Parallel(DK):
+                q_fragment[jk] *= scale
+
+            a_raw[0] = a[0, bn, bh]
+            b_raw[0] = b[0, bn, bh]
+            x[0] = a_raw[0] + dt_bias[bh]
+            beta_x[0] = softplus_beta * x[0]
+            if beta_x[0] <= softplus_threshold:
+                softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+            else:
+                softplus_x[0] = x[0]
+            exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+            beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
+
+            for jk, jv in T.Parallel(DK, DV):
+                h_fragment[jk, jv] *= exp_g[0]
+
+            for jk, jv in T.Parallel(DK, DV):
+                reduce_fragment[jk, jv] = h_fragment[jk, jv] * k_fragment[jk]
+            T.reduce_sum(reduce_fragment, kv_fragment, dim=0, clear=True)
+
+            for jv in T.Parallel(DV):
+                v_fragment[jv] = v[0, bn, bh, jv]
+                v_fragment[jv] = (v_fragment[jv] - kv_fragment[jv]) * beta[0]
+
+            for jk, jv in T.Parallel(DK, DV):
+                h_fragment[jk, jv] += k_fragment[jk] * v_fragment[jv]
+
+            for jk, jv in T.Parallel(DK, DV):
+                reduce_fragment[jk, jv] = h_fragment[jk, jv] * q_fragment[jk]
+            T.reduce_sum(reduce_fragment, o_fragment, dim=0, clear=True)
+
+            for jv in T.Parallel(DV):
+                o[0, bn, bh, jv] = o_fragment[jv]
+
+            if state_idx >= 0:
+                for jk, jv in T.Parallel(DK, DV):
+                    h0_source[state_idx, bh, jv, jk] = h_fragment[jk, jv]
+
+    return tilelang_sglang_fused_gdn_decode_fullv_kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_sglang_fused_gdn_decode_bv32_warp(
+    H,
+    HV,
+    DK,
+    DV,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+    block_DV = 32
+    num_value_tiles = tilelang.cdiv(DV, block_DV)
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_sglang_fused_gdn_decode_bv32_warp_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV * num_value_tiles, threads=32) as (bid,):
+            bnh = bid // num_value_tiles
+            bv = bid % num_value_tiles
+            bn = bnh // HV
+            bh = bnh % HV
+            bhq = bh // (HV // H)
+
+            state_idx = T.alloc_var("int32")
+            state_idx = h0_indices[bn]
+
+            # DK is fixed to 128 by the Python wrapper, so each warp lane owns four K values.
+            q_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((32,), dtype=accum_dtype)
+            beta = T.alloc_fragment((32,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((32,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((32,), dtype=accum_dtype)
+            x = T.alloc_fragment((32,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
+            kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
+            v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
+            o_value = T.alloc_fragment((32,), dtype=accum_dtype)
+
+            for tx in T.Parallel(32):
+                q_lane_0[tx] = q[0, bn, bhq, tx]
+                q_lane_1[tx] = q[0, bn, bhq, tx + 32]
+                q_lane_2[tx] = q[0, bn, bhq, tx + 64]
+                q_lane_3[tx] = q[0, bn, bhq, tx + 96]
+                k_lane_0[tx] = k[0, bn, bhq, tx]
+                k_lane_1[tx] = k[0, bn, bhq, tx + 32]
+                k_lane_2[tx] = k[0, bn, bhq, tx + 64]
+                k_lane_3[tx] = k[0, bn, bhq, tx + 96]
+                q_norm[tx] = (
+                    q_lane_0[tx] * q_lane_0[tx]
+                    + q_lane_1[tx] * q_lane_1[tx]
+                    + q_lane_2[tx] * q_lane_2[tx]
+                    + q_lane_3[tx] * q_lane_3[tx]
+                )
+                k_norm[tx] = (
+                    k_lane_0[tx] * k_lane_0[tx]
+                    + k_lane_1[tx] * k_lane_1[tx]
+                    + k_lane_2[tx] * k_lane_2[tx]
+                    + k_lane_3[tx] * k_lane_3[tx]
+                )
+
+                if use_qk_l2norm_in_kernel:
+                    q_norm[tx] = T.warp_reduce_sum(q_norm[tx])
+                    k_norm[tx] = T.warp_reduce_sum(k_norm[tx])
+                    q_norm[tx] = T.rsqrt(q_norm[tx] + 1e-6)
+                    k_norm[tx] = T.rsqrt(k_norm[tx] + 1e-6)
+                    q_lane_0[tx] *= q_norm[tx]
+                    q_lane_1[tx] *= q_norm[tx]
+                    q_lane_2[tx] *= q_norm[tx]
+                    q_lane_3[tx] *= q_norm[tx]
+                    k_lane_0[tx] *= k_norm[tx]
+                    k_lane_1[tx] *= k_norm[tx]
+                    k_lane_2[tx] *= k_norm[tx]
+                    k_lane_3[tx] *= k_norm[tx]
+
+                q_lane_0[tx] *= scale
+                q_lane_1[tx] *= scale
+                q_lane_2[tx] *= scale
+                q_lane_3[tx] *= scale
+
+                a_raw[tx] = a[0, bn, bh]
+                b_raw[tx] = b[0, bn, bh]
+                x[tx] = a_raw[tx] + dt_bias[bh]
+                beta_x[tx] = softplus_beta * x[tx]
+                if beta_x[tx] <= softplus_threshold:
+                    softplus_x[tx] = T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
+                else:
+                    softplus_x[tx] = x[tx]
+                exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
+                beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
+
+                for jv in T.serial(block_DV):
+                    h_lane_0[tx] = 0.0
+                    h_lane_1[tx] = 0.0
+                    h_lane_2[tx] = 0.0
+                    h_lane_3[tx] = 0.0
+                    if state_idx >= 0:
+                        h_lane_0[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx
+                        ]
+                        h_lane_1[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 32
+                        ]
+                        h_lane_2[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 64
+                        ]
+                        h_lane_3[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 96
+                        ]
+                    h_lane_0[tx] *= exp_g[tx]
+                    h_lane_1[tx] *= exp_g[tx]
+                    h_lane_2[tx] *= exp_g[tx]
+                    h_lane_3[tx] *= exp_g[tx]
+                    local_sum[tx] = (
+                        h_lane_0[tx] * k_lane_0[tx]
+                        + h_lane_1[tx] * k_lane_1[tx]
+                        + h_lane_2[tx] * k_lane_2[tx]
+                        + h_lane_3[tx] * k_lane_3[tx]
+                    )
+
+                    kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                    v_delta[tx] = (
+                        v[0, bn, bh, bv * block_DV + jv] - kv_value[tx]
+                    ) * beta[tx]
+
+                    h_new_lane_0[tx] = h_lane_0[tx] + k_lane_0[tx] * v_delta[tx]
+                    h_new_lane_1[tx] = h_lane_1[tx] + k_lane_1[tx] * v_delta[tx]
+                    h_new_lane_2[tx] = h_lane_2[tx] + k_lane_2[tx] * v_delta[tx]
+                    h_new_lane_3[tx] = h_lane_3[tx] + k_lane_3[tx] * v_delta[tx]
+                    if state_idx >= 0:
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx] = (
+                            h_new_lane_0[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 32] = (
+                            h_new_lane_1[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 64] = (
+                            h_new_lane_2[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 96] = (
+                            h_new_lane_3[tx]
+                        )
+                    local_sum[tx] = (
+                        h_new_lane_0[tx] * q_lane_0[tx]
+                        + h_new_lane_1[tx] * q_lane_1[tx]
+                        + h_new_lane_2[tx] * q_lane_2[tx]
+                        + h_new_lane_3[tx] * q_lane_3[tx]
+                    )
+
+                    o_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                    if tx == 0:
+                        o[0, bn, bh, bv * block_DV + jv] = o_value[tx]
+
+    return tilelang_sglang_fused_gdn_decode_bv32_warp_kernel
+
+
 def _identity_i32(n: int, device: torch.device):
     return torch.arange(n, dtype=torch.int32, device=device)
+
+
+def _is_sm12x(device: torch.device) -> bool:
+    major, _ = torch.cuda.get_device_capability(device)
+    return major == 12
 
 
 def _contiguous_state_view(state: torch.Tensor, num_value_heads: int, head_k_dim: int, head_v_dim: int):
@@ -251,6 +985,7 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_steps: int | None = None,
     retrieve_parent_token: torch.Tensor | None = None,
     block_dv: int | None = None,
+    assume_regular: bool = False,
 ) -> torch.Tensor:
     if q.shape[0] != 1 or k.shape[0] != 1 or v.shape[0] != 1:
         raise ValueError("SGLang-compatible FlashQLA kernel expects flattened [1, total_tokens, ...] inputs")
@@ -285,14 +1020,20 @@ def fused_sigmoid_gating_delta_rule_update(
         initial_state_source, num_value_heads, head_k_dim, head_v_dim
     )
     num_sequences = state.shape[0]
+    use_regular_kernel = _is_sm12x(q.device) and (assume_regular or cu_seqlens is None)
+    if total_tokens % num_sequences != 0:
+        if use_regular_kernel and assume_regular:
+            raise ValueError("assume_regular=True requires total_tokens divisible by num_sequences")
+        regular_tokens_per_seq = None
+    else:
+        regular_tokens_per_seq = total_tokens // num_sequences
     if cu_seqlens is None:
-        if total_tokens % num_sequences != 0:
+        if regular_tokens_per_seq is None:
             raise ValueError("total_tokens must be divisible by num_sequences when cu_seqlens is omitted")
-        tokens_per_seq = total_tokens // num_sequences
         cu_seqlens = torch.arange(
             0,
             total_tokens + 1,
-            tokens_per_seq,
+            regular_tokens_per_seq,
             dtype=torch.int32,
             device=q.device,
         )
@@ -348,48 +1089,193 @@ def fused_sigmoid_gating_delta_rule_update(
         scale = head_k_dim ** -0.5
 
     o = torch.empty_like(v)
-    block_DV = block_dv or min(128, 1 << (head_v_dim - 1).bit_length())
-    kernel = tilelang_sglang_fused_gdn(
-        H=num_key_heads,
-        HV=num_value_heads,
-        DK=head_k_dim,
-        DV=head_v_dim,
-        scale=scale,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        q_dtype=q.dtype,
-        k_dtype=k.dtype,
-        v_dtype=v.dtype,
-        a_dtype=a.dtype,
-        b_dtype=b.dtype,
-        a_log_dtype=A_log.dtype,
-        dt_bias_dtype=dt_bias.dtype,
-        state_dtype=state.dtype,
-        indices_dtype=torch.int32,
-        o_dtype=o.dtype,
-        accum_dtype="float32",
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        disable_state_update=disable_state_update,
-        cache_intermediate_states=cache_intermediate,
-        has_tree_attention=has_tree,
-        block_DV=block_DV,
-    )
-    kernel(
-        A_log.contiguous(),
-        a,
-        dt_bias.contiguous(),
-        q,
-        k,
-        v,
-        b,
-        state,
-        initial_state_indices,
-        cu_seqlens,
-        intermediate,
-        intermediate_state_indices,
-        retrieve_parent_token,
-        o,
-    )
+    if block_dv is not None:
+        block_DV = block_dv
+    elif (
+        use_regular_kernel
+        and regular_tokens_per_seq == 1
+        and not cache_intermediate
+        and not has_tree
+        and not disable_state_update
+    ):
+        block_DV = 32
+    else:
+        block_DV = min(128, 1 << (head_v_dim - 1).bit_length())
+    if (
+        use_regular_kernel
+        and regular_tokens_per_seq == 1
+        and block_DV in (32, head_v_dim)
+        and not cache_intermediate
+        and not has_tree
+        and not disable_state_update
+    ):
+        decode_kernel = (
+            tilelang_sglang_fused_gdn_decode_bv32_warp
+            if block_DV == 32
+            else tilelang_sglang_fused_gdn_decode_fullv
+        )
+        kernel = decode_kernel(
+            H=num_key_heads,
+            HV=num_value_heads,
+            DK=head_k_dim,
+            DV=head_v_dim,
+            scale=scale,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            a_dtype=a.dtype,
+            b_dtype=b.dtype,
+            a_log_dtype=A_log.dtype,
+            dt_bias_dtype=dt_bias.dtype,
+            state_dtype=state.dtype,
+            indices_dtype=torch.int32,
+            o_dtype=o.dtype,
+            accum_dtype="float32",
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        kernel(
+            A_log.contiguous(),
+            a,
+            dt_bias.contiguous(),
+            q,
+            k,
+            v,
+            b,
+            state,
+            initial_state_indices,
+            o,
+        )
+        return o
+    if use_regular_kernel:
+        if regular_tokens_per_seq is None:
+            raise ValueError("regular SGLang fused kernel requires equal sequence lengths")
+        if block_DV == head_v_dim:
+            kernel = tilelang_sglang_fused_gdn_regular_fullv(
+                H=num_key_heads,
+                HV=num_value_heads,
+                DK=head_k_dim,
+                DV=head_v_dim,
+                tokens_per_seq=regular_tokens_per_seq,
+                scale=scale,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                a_dtype=a.dtype,
+                b_dtype=b.dtype,
+                a_log_dtype=A_log.dtype,
+                dt_bias_dtype=dt_bias.dtype,
+                state_dtype=state.dtype,
+                indices_dtype=torch.int32,
+                o_dtype=o.dtype,
+                accum_dtype="float32",
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                disable_state_update=disable_state_update,
+                cache_intermediate_states=cache_intermediate,
+                has_tree_attention=has_tree,
+            )
+            kernel(
+                A_log.contiguous(),
+                a,
+                dt_bias.contiguous(),
+                q,
+                k,
+                v,
+                b,
+                state,
+                initial_state_indices,
+                intermediate,
+                intermediate_state_indices,
+                retrieve_parent_token,
+                o,
+            )
+        else:
+            kernel = tilelang_sglang_fused_gdn_regular(
+                H=num_key_heads,
+                HV=num_value_heads,
+                DK=head_k_dim,
+                DV=head_v_dim,
+                tokens_per_seq=regular_tokens_per_seq,
+                scale=scale,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                a_dtype=a.dtype,
+                b_dtype=b.dtype,
+                a_log_dtype=A_log.dtype,
+                dt_bias_dtype=dt_bias.dtype,
+                state_dtype=state.dtype,
+                indices_dtype=torch.int32,
+                o_dtype=o.dtype,
+                accum_dtype="float32",
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                disable_state_update=disable_state_update,
+                cache_intermediate_states=cache_intermediate,
+                has_tree_attention=has_tree,
+                block_DV=block_DV,
+            )
+            kernel(
+                A_log.contiguous(),
+                a,
+                dt_bias.contiguous(),
+                q,
+                k,
+                v,
+                b,
+                state,
+                initial_state_indices,
+                intermediate,
+                intermediate_state_indices,
+                retrieve_parent_token,
+                o,
+            )
+    else:
+        kernel = tilelang_sglang_fused_gdn(
+            H=num_key_heads,
+            HV=num_value_heads,
+            DK=head_k_dim,
+            DV=head_v_dim,
+            scale=scale,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            a_dtype=a.dtype,
+            b_dtype=b.dtype,
+            a_log_dtype=A_log.dtype,
+            dt_bias_dtype=dt_bias.dtype,
+            state_dtype=state.dtype,
+            indices_dtype=torch.int32,
+            o_dtype=o.dtype,
+            accum_dtype="float32",
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            disable_state_update=disable_state_update,
+            cache_intermediate_states=cache_intermediate,
+            has_tree_attention=has_tree,
+            block_DV=block_DV,
+        )
+        kernel(
+            A_log.contiguous(),
+            a,
+            dt_bias.contiguous(),
+            q,
+            k,
+            v,
+            b,
+            state,
+            initial_state_indices,
+            cu_seqlens,
+            intermediate,
+            intermediate_state_indices,
+            retrieve_parent_token,
+            o,
+        )
     return o
 
 

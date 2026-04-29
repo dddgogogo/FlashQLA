@@ -141,6 +141,7 @@ def run_case(
         use_qk_l2norm_in_kernel=True,
         cu_seqlens=cu_seqlens,
         block_dv=block_dv,
+        assume_regular=True,
         **q_kwargs,
     )
     torch.cuda.synchronize()
@@ -184,6 +185,7 @@ def run_case(
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlens,
             block_dv=block_dv,
+            assume_regular=True,
             **q_kwargs,
         )
 
