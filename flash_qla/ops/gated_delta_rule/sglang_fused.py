@@ -937,6 +937,292 @@ def tilelang_sglang_fused_gdn_decode_bv32_warp(
     return tilelang_sglang_fused_gdn_decode_bv32_warp_kernel
 
 
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_sglang_fused_gdn_regular_bv32_warp(
+    H,
+    HV,
+    DK,
+    DV,
+    tokens_per_seq,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+    disable_state_update,
+    cache_intermediate_states,
+    has_tree_attention,
+    block_DV: int = 32,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+    cache_steps = T.dynamic("cache_steps")
+    num_value_tiles = tilelang.cdiv(DV, block_DV)
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+    intermediate_shape = (num_sequences, cache_steps, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_sglang_fused_gdn_regular_bv32_warp_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        intermediate_states_buffer: T.Tensor(intermediate_shape, dtype=state_dtype),
+        intermediate_state_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        retrieve_parent_token: T.Tensor((num_sequences, cache_steps), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV * num_value_tiles, threads=32) as (bid,):
+            bnh = bid // num_value_tiles
+            bv = bid % num_value_tiles
+            bn = bnh // HV
+            bh = bnh % HV
+            bhq = bh // (HV // H)
+
+            seq_start = T.alloc_var("int32")
+            state_idx = T.alloc_var("int32")
+            cache_idx = T.alloc_var("int32")
+            token_idx = T.alloc_var("int32")
+
+            seq_start = bn * tokens_per_seq
+            state_idx = h0_indices[bn]
+            cache_idx = -1
+            if cache_intermediate_states:
+                cache_idx = intermediate_state_indices[bn]
+
+            # DK is fixed to 128 by the Python wrapper, so each warp lane owns four K values.
+            q_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_0 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
+            h_lane_1 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
+            h_lane_2 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
+            h_lane_3 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((32,), dtype=accum_dtype)
+            beta = T.alloc_fragment((32,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((32,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((32,), dtype=accum_dtype)
+            x = T.alloc_fragment((32,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
+            kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
+            v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
+            o_value = T.alloc_fragment((32,), dtype=accum_dtype)
+            parent_step = T.alloc_fragment((1,), dtype=indices_dtype)
+
+            for jv in T.serial(block_DV):
+                for tx in T.Parallel(32):
+                    h_lane_0[jv, tx] = 0.0
+                    h_lane_1[jv, tx] = 0.0
+                    h_lane_2[jv, tx] = 0.0
+                    h_lane_3[jv, tx] = 0.0
+                    if state_idx >= 0:
+                        h_lane_0[jv, tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx
+                        ]
+                        h_lane_1[jv, tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 32
+                        ]
+                        h_lane_2[jv, tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 64
+                        ]
+                        h_lane_3[jv, tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 96
+                        ]
+
+            for step in T.serial(tokens_per_seq):
+                token_idx = seq_start + step
+
+                if has_tree_attention:
+                    if step != 0 and cache_idx >= 0:
+                        parent_step[0] = retrieve_parent_token[bn, step]
+                        for jv in T.serial(block_DV):
+                            for tx in T.Parallel(32):
+                                h_lane_0[jv, tx] = intermediate_states_buffer[
+                                    cache_idx,
+                                    parent_step[0],
+                                    bh,
+                                    bv * block_DV + jv,
+                                    tx,
+                                ]
+                                h_lane_1[jv, tx] = intermediate_states_buffer[
+                                    cache_idx,
+                                    parent_step[0],
+                                    bh,
+                                    bv * block_DV + jv,
+                                    tx + 32,
+                                ]
+                                h_lane_2[jv, tx] = intermediate_states_buffer[
+                                    cache_idx,
+                                    parent_step[0],
+                                    bh,
+                                    bv * block_DV + jv,
+                                    tx + 64,
+                                ]
+                                h_lane_3[jv, tx] = intermediate_states_buffer[
+                                    cache_idx,
+                                    parent_step[0],
+                                    bh,
+                                    bv * block_DV + jv,
+                                    tx + 96,
+                                ]
+
+                for tx in T.Parallel(32):
+                    q_lane_0[tx] = q[0, token_idx, bhq, tx]
+                    q_lane_1[tx] = q[0, token_idx, bhq, tx + 32]
+                    q_lane_2[tx] = q[0, token_idx, bhq, tx + 64]
+                    q_lane_3[tx] = q[0, token_idx, bhq, tx + 96]
+                    k_lane_0[tx] = k[0, token_idx, bhq, tx]
+                    k_lane_1[tx] = k[0, token_idx, bhq, tx + 32]
+                    k_lane_2[tx] = k[0, token_idx, bhq, tx + 64]
+                    k_lane_3[tx] = k[0, token_idx, bhq, tx + 96]
+                    q_norm[tx] = (
+                        q_lane_0[tx] * q_lane_0[tx]
+                        + q_lane_1[tx] * q_lane_1[tx]
+                        + q_lane_2[tx] * q_lane_2[tx]
+                        + q_lane_3[tx] * q_lane_3[tx]
+                    )
+                    k_norm[tx] = (
+                        k_lane_0[tx] * k_lane_0[tx]
+                        + k_lane_1[tx] * k_lane_1[tx]
+                        + k_lane_2[tx] * k_lane_2[tx]
+                        + k_lane_3[tx] * k_lane_3[tx]
+                    )
+
+                    if use_qk_l2norm_in_kernel:
+                        q_norm[tx] = T.warp_reduce_sum(q_norm[tx])
+                        k_norm[tx] = T.warp_reduce_sum(k_norm[tx])
+                        q_norm[tx] = T.rsqrt(q_norm[tx] + 1e-6)
+                        k_norm[tx] = T.rsqrt(k_norm[tx] + 1e-6)
+                        q_lane_0[tx] *= q_norm[tx]
+                        q_lane_1[tx] *= q_norm[tx]
+                        q_lane_2[tx] *= q_norm[tx]
+                        q_lane_3[tx] *= q_norm[tx]
+                        k_lane_0[tx] *= k_norm[tx]
+                        k_lane_1[tx] *= k_norm[tx]
+                        k_lane_2[tx] *= k_norm[tx]
+                        k_lane_3[tx] *= k_norm[tx]
+
+                    q_lane_0[tx] *= scale
+                    q_lane_1[tx] *= scale
+                    q_lane_2[tx] *= scale
+                    q_lane_3[tx] *= scale
+
+                    a_raw[tx] = a[0, token_idx, bh]
+                    b_raw[tx] = b[0, token_idx, bh]
+                    x[tx] = a_raw[tx] + dt_bias[bh]
+                    beta_x[tx] = softplus_beta * x[tx]
+                    if beta_x[tx] <= softplus_threshold:
+                        softplus_x[tx] = (
+                            T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
+                        )
+                    else:
+                        softplus_x[tx] = x[tx]
+                    exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
+                    beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
+
+                for jv in T.serial(block_DV):
+                    for tx in T.Parallel(32):
+                        h_lane_0[jv, tx] *= exp_g[tx]
+                        h_lane_1[jv, tx] *= exp_g[tx]
+                        h_lane_2[jv, tx] *= exp_g[tx]
+                        h_lane_3[jv, tx] *= exp_g[tx]
+                        local_sum[tx] = (
+                            h_lane_0[jv, tx] * k_lane_0[tx]
+                            + h_lane_1[jv, tx] * k_lane_1[tx]
+                            + h_lane_2[jv, tx] * k_lane_2[tx]
+                            + h_lane_3[jv, tx] * k_lane_3[tx]
+                        )
+
+                        kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                        v_delta[tx] = (
+                            v[0, token_idx, bh, bv * block_DV + jv] - kv_value[tx]
+                        ) * beta[tx]
+
+                        h_lane_0[jv, tx] += k_lane_0[tx] * v_delta[tx]
+                        h_lane_1[jv, tx] += k_lane_1[tx] * v_delta[tx]
+                        h_lane_2[jv, tx] += k_lane_2[tx] * v_delta[tx]
+                        h_lane_3[jv, tx] += k_lane_3[tx] * v_delta[tx]
+                        local_sum[tx] = (
+                            h_lane_0[jv, tx] * q_lane_0[tx]
+                            + h_lane_1[jv, tx] * q_lane_1[tx]
+                            + h_lane_2[jv, tx] * q_lane_2[tx]
+                            + h_lane_3[jv, tx] * q_lane_3[tx]
+                        )
+
+                        o_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                        if tx == 0:
+                            o[0, token_idx, bh, bv * block_DV + jv] = o_value[tx]
+
+                        if cache_intermediate_states:
+                            if cache_idx >= 0:
+                                intermediate_states_buffer[
+                                    cache_idx, step, bh, bv * block_DV + jv, tx
+                                ] = h_lane_0[jv, tx]
+                                intermediate_states_buffer[
+                                    cache_idx, step, bh, bv * block_DV + jv, tx + 32
+                                ] = h_lane_1[jv, tx]
+                                intermediate_states_buffer[
+                                    cache_idx, step, bh, bv * block_DV + jv, tx + 64
+                                ] = h_lane_2[jv, tx]
+                                intermediate_states_buffer[
+                                    cache_idx, step, bh, bv * block_DV + jv, tx + 96
+                                ] = h_lane_3[jv, tx]
+
+            if not disable_state_update:
+                if state_idx >= 0:
+                    for jv in T.serial(block_DV):
+                        for tx in T.Parallel(32):
+                            h0_source[state_idx, bh, bv * block_DV + jv, tx] = (
+                                h_lane_0[jv, tx]
+                            )
+                            h0_source[
+                                state_idx, bh, bv * block_DV + jv, tx + 32
+                            ] = h_lane_1[jv, tx]
+                            h0_source[
+                                state_idx, bh, bv * block_DV + jv, tx + 64
+                            ] = h_lane_2[jv, tx]
+                            h0_source[
+                                state_idx, bh, bv * block_DV + jv, tx + 96
+                            ] = h_lane_3[jv, tx]
+
+    return tilelang_sglang_fused_gdn_regular_bv32_warp_kernel
+
+
 def _identity_i32(n: int, device: torch.device):
     return torch.arange(n, dtype=torch.int32, device=device)
 
@@ -1091,10 +1377,11 @@ def fused_sigmoid_gating_delta_rule_update(
     o = torch.empty_like(v)
     if block_dv is not None:
         block_DV = block_dv
+    elif use_regular_kernel and cache_intermediate:
+        block_DV = 8
     elif (
         use_regular_kernel
         and regular_tokens_per_seq == 1
-        and not cache_intermediate
         and not has_tree
         and not disable_state_update
     ):
@@ -1151,7 +1438,49 @@ def fused_sigmoid_gating_delta_rule_update(
     if use_regular_kernel:
         if regular_tokens_per_seq is None:
             raise ValueError("regular SGLang fused kernel requires equal sequence lengths")
-        if block_DV == head_v_dim:
+        if block_DV in (8, 16, 32, 64):
+            kernel = tilelang_sglang_fused_gdn_regular_bv32_warp(
+                H=num_key_heads,
+                HV=num_value_heads,
+                DK=head_k_dim,
+                DV=head_v_dim,
+                tokens_per_seq=regular_tokens_per_seq,
+                scale=scale,
+                softplus_beta=softplus_beta,
+                softplus_threshold=softplus_threshold,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                v_dtype=v.dtype,
+                a_dtype=a.dtype,
+                b_dtype=b.dtype,
+                a_log_dtype=A_log.dtype,
+                dt_bias_dtype=dt_bias.dtype,
+                state_dtype=state.dtype,
+                indices_dtype=torch.int32,
+                o_dtype=o.dtype,
+                accum_dtype="float32",
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                disable_state_update=disable_state_update,
+                cache_intermediate_states=cache_intermediate,
+                has_tree_attention=has_tree,
+                block_DV=block_DV,
+            )
+            kernel(
+                A_log.contiguous(),
+                a,
+                dt_bias.contiguous(),
+                q,
+                k,
+                v,
+                b,
+                state,
+                initial_state_indices,
+                intermediate,
+                intermediate_state_indices,
+                retrieve_parent_token,
+                o,
+            )
+        elif block_DV == head_v_dim:
             kernel = tilelang_sglang_fused_gdn_regular_fullv(
                 H=num_key_heads,
                 HV=num_value_heads,
