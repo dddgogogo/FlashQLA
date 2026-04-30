@@ -194,6 +194,22 @@ def make_parent(batch: int, tokens_per_seq: int, pattern: str, seed: int) -> tor
     return parent
 
 
+def case_seed(base_seed: int, case: BenchCase) -> int:
+    mode_id = {"decode": 1, "verify": 2, "tree": 3}[case.mode]
+    parent_id = {"none": 0, "chain": 1, "binary": 2, "star": 3, "random": 4}[case.parent_pattern]
+    state_id = {"identity": 1, "reverse": 2, "negative_last": 3}[case.state_indices]
+    qk_id = 1 if case.qk_l2norm else 0
+    return (
+        base_seed
+        + mode_id * 1_000_003
+        + parent_id * 100_003
+        + state_id * 10_007
+        + case.batch * 503
+        + case.tokens_per_seq * 53
+        + qk_id * 7
+    )
+
+
 def bench_cuda_ms(fn, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
@@ -258,7 +274,7 @@ def run_case(
     sglang_update,
     args: argparse.Namespace,
 ) -> BenchResult:
-    seed = args.seed + case_id * 97 + case.batch * 17 + case.tokens_per_seq
+    seed = case_seed(args.seed, case)
     torch.manual_seed(seed)
     dtype = getattr(torch, args.dtype)
     q, k, v, a, b, a_log, dt_bias, state0, cu_seqlens = make_inputs(

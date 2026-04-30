@@ -1,6 +1,268 @@
+import os
+
 import torch
 import tilelang
 import tilelang.language as T
+
+
+_RECURRENT_AUTOTUNE_CACHE: dict[tuple, int] = {}
+
+
+def clear_recurrent_autotune_cache() -> None:
+    _RECURRENT_AUTOTUNE_CACHE.clear()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() not in ("0", "false", "off", "no")
+
+
+# Opt-in: the cached Python dispatch still costs enough to regress tiny kernels.
+_RECURRENT_AUTOTUNE_ENABLED = _env_flag("FLASHQLA_RECURRENT_AUTOTUNE", False)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(value, 0)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(value, 0.0)
+
+
+def _autotune_enabled() -> bool:
+    return _RECURRENT_AUTOTUNE_ENABLED
+
+
+def _valid_block_dv_candidates(candidates: list[int], head_v_dim: int) -> list[int]:
+    valid: list[int] = []
+    for block_dv in candidates:
+        if block_dv in valid:
+            continue
+        if block_dv > head_v_dim:
+            continue
+        if block_dv in (4, 8, 16, 32, 64) or block_dv == head_v_dim:
+            valid.append(block_dv)
+    return valid
+
+
+def _autotune_block_dv_candidates(
+    num_sequences: int,
+    regular_tokens_per_seq: int | None,
+    head_v_dim: int,
+    cache_intermediate: bool,
+    has_tree: bool,
+    disable_state_update: bool,
+) -> list[int]:
+    if regular_tokens_per_seq is None:
+        return []
+    if cache_intermediate:
+        return _valid_block_dv_candidates([4, 8], head_v_dim)
+    if (
+        regular_tokens_per_seq == 1
+        and not has_tree
+        and not disable_state_update
+    ):
+        if num_sequences == 1:
+            return _valid_block_dv_candidates([32, 16, head_v_dim], head_v_dim)
+        if num_sequences <= 4:
+            return _valid_block_dv_candidates([16, 4, 8, 32], head_v_dim)
+        return _valid_block_dv_candidates([4, 8, 16, 32], head_v_dim)
+    return []
+
+
+def _autotune_cache_key(
+    q: torch.Tensor,
+    state: torch.Tensor,
+    num_key_heads: int,
+    num_value_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    num_sequences: int,
+    regular_tokens_per_seq: int | None,
+    cache_steps: int,
+    cache_intermediate: bool,
+    has_tree: bool,
+    disable_state_update: bool,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple:
+    mode = 2 if has_tree else 1 if cache_intermediate else 0
+    return (
+        q.get_device(),
+        mode,
+        num_key_heads,
+        num_value_heads,
+        head_k_dim,
+        head_v_dim,
+        num_sequences,
+        regular_tokens_per_seq,
+        cache_steps,
+        cache_intermediate,
+        has_tree,
+        disable_state_update,
+        use_qk_l2norm_in_kernel,
+        q.dtype,
+        state.dtype,
+    )
+
+
+def _benchmark_recurrent_block_dv(
+    block_dv: int,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float,
+    softplus_beta: float,
+    softplus_threshold: float,
+    use_qk_l2norm_in_kernel: bool,
+    cu_seqlens: torch.Tensor,
+    disable_state_update: bool,
+    intermediate: torch.Tensor | None,
+    intermediate_state_indices: torch.Tensor,
+    cache_steps: int,
+    retrieve_parent_token: torch.Tensor | None,
+    warmup: int,
+    iters: int,
+) -> float:
+    trial_state = state.detach().clone()
+    trial_intermediate = torch.empty_like(intermediate) if intermediate is not None else None
+
+    def call() -> None:
+        fused_sigmoid_gating_delta_rule_update(
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            trial_state,
+            initial_state_indices,
+            scale=scale,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            disable_state_update=disable_state_update,
+            intermediate_states_buffer=trial_intermediate,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_steps,
+            retrieve_parent_token=retrieve_parent_token,
+            block_dv=block_dv,
+            assume_regular=True,
+        )
+
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize(q.device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    stream = torch.cuda.current_stream(q.device)
+    start.record(stream)
+    for _ in range(iters):
+        call()
+    end.record(stream)
+    end.synchronize()
+    return start.elapsed_time(end) / max(iters, 1)
+
+
+def _select_autotuned_block_dv(
+    fallback_block_dv: int,
+    candidates: list[int],
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float,
+    softplus_beta: float,
+    softplus_threshold: float,
+    use_qk_l2norm_in_kernel: bool,
+    cu_seqlens: torch.Tensor,
+    disable_state_update: bool,
+    intermediate: torch.Tensor | None,
+    intermediate_state_indices: torch.Tensor,
+    cache_steps: int,
+    retrieve_parent_token: torch.Tensor | None,
+    cache_key: tuple,
+) -> int:
+    cached = _RECURRENT_AUTOTUNE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if getattr(torch.cuda, "is_current_stream_capturing", lambda: False)():
+        return fallback_block_dv
+    if len(candidates) <= 1:
+        selected = candidates[0] if candidates else fallback_block_dv
+        _RECURRENT_AUTOTUNE_CACHE[cache_key] = selected
+        return selected
+
+    warmup = _env_int("FLASHQLA_RECURRENT_AUTOTUNE_WARMUP", 5)
+    iters = _env_int("FLASHQLA_RECURRENT_AUTOTUNE_ITERS", 30)
+    if iters == 0:
+        _RECURRENT_AUTOTUNE_CACHE[cache_key] = fallback_block_dv
+        return fallback_block_dv
+
+    candidates = _valid_block_dv_candidates([fallback_block_dv, *candidates], v.shape[-1])
+    timings: dict[int, float] = {}
+    for candidate in candidates:
+        timings[candidate] = _benchmark_recurrent_block_dv(
+            candidate,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            state,
+            initial_state_indices,
+            scale,
+            softplus_beta,
+            softplus_threshold,
+            use_qk_l2norm_in_kernel,
+            cu_seqlens,
+            disable_state_update,
+            intermediate,
+            intermediate_state_indices,
+            cache_steps,
+            retrieve_parent_token,
+            warmup,
+            iters,
+        )
+    measured_best = min(timings, key=timings.get)
+    fallback_ms = timings.get(fallback_block_dv)
+    margin = _env_float("FLASHQLA_RECURRENT_AUTOTUNE_MARGIN", 0.03)
+    if fallback_ms is None or timings[measured_best] < fallback_ms * (1.0 - margin):
+        selected = measured_best
+    else:
+        selected = fallback_block_dv
+    _RECURRENT_AUTOTUNE_CACHE[cache_key] = selected
+    return selected
 
 
 @tilelang.jit(
@@ -2346,6 +2608,17 @@ def fused_sigmoid_gating_delta_rule_update(
     elif (
         use_regular_kernel
         and cache_intermediate
+        and not has_tree
+        and disable_state_update
+        and num_value_heads == 48
+        and regular_tokens_per_seq is not None
+        and regular_tokens_per_seq <= 32
+        and num_sequences <= 8
+    ):
+        block_DV = 4 if num_sequences >= 4 or regular_tokens_per_seq == 2 else 8
+    elif (
+        use_regular_kernel
+        and cache_intermediate
         and regular_tokens_per_seq is not None
         and regular_tokens_per_seq <= 16
         and num_sequences <= 4
@@ -2370,6 +2643,65 @@ def fused_sigmoid_gating_delta_rule_update(
         block_DV = 32
     else:
         block_DV = min(128, 1 << (head_v_dim - 1).bit_length())
+    if block_dv is None and use_regular_kernel and _autotune_enabled():
+        can_autotune = cache_intermediate or (
+            regular_tokens_per_seq == 1
+            and not has_tree
+            and not disable_state_update
+        )
+        if can_autotune:
+            cache_key = _autotune_cache_key(
+                q,
+                state,
+                num_key_heads,
+                num_value_heads,
+                head_k_dim,
+                head_v_dim,
+                num_sequences,
+                regular_tokens_per_seq,
+                cache_steps,
+                cache_intermediate,
+                has_tree,
+                disable_state_update,
+                use_qk_l2norm_in_kernel,
+            )
+            cached_block_DV = _RECURRENT_AUTOTUNE_CACHE.get(cache_key)
+            if cached_block_DV is not None:
+                block_DV = cached_block_DV
+            else:
+                candidates = _autotune_block_dv_candidates(
+                    num_sequences,
+                    regular_tokens_per_seq,
+                    head_v_dim,
+                    cache_intermediate,
+                    has_tree,
+                    disable_state_update,
+                )
+                if len(candidates) > 1:
+                    block_DV = _select_autotuned_block_dv(
+                        block_DV,
+                        candidates,
+                        A_log,
+                        a,
+                        dt_bias,
+                        q,
+                        k,
+                        v,
+                        b,
+                        state,
+                        initial_state_indices,
+                        scale,
+                        softplus_beta,
+                        softplus_threshold,
+                        use_qk_l2norm_in_kernel,
+                        cu_seqlens,
+                        disable_state_update,
+                        intermediate,
+                        intermediate_state_indices,
+                        cache_steps,
+                        retrieve_parent_token,
+                        cache_key,
+                    )
     if (
         use_regular_kernel
         and regular_tokens_per_seq == 1
