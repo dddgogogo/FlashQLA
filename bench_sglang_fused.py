@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flash_qla.ops.gated_delta_rule.sglang_fused import (
+from flash_qla.ops.gated_delta_rule.recurrent_fused import (
     fused_sigmoid_gating_delta_rule_update as qla_update,
 )
 
