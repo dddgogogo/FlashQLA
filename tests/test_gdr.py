@@ -17,6 +17,7 @@ from fla.ops.gated_delta_rule.chunk import (
 
 from flash_qla import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_qla
 from flash_qla import chunk_gated_delta_rule_bwd as chunk_gated_delta_rule_bwd_qla
+from flash_qla.ops.gated_delta_rule.chunk.arch import is_sm12x
 from flash_qla.utils import l2norm, pack, profile
 
 from ref_gdr import chunk_gated_delta_rule_fwd as chunk_gated_delta_rule_fwd_ref
@@ -169,7 +170,8 @@ def test_gated_delta_rule(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
     )
-    g_qla, A_qla, o_qla, h_qla, s_qla = chunk_gated_delta_rule_fwd_qla(
+    qla_output_v_new = is_sm12x()
+    qla_fwd_result = chunk_gated_delta_rule_fwd_qla(
         q=q,
         k=k,
         v=v,
@@ -181,7 +183,13 @@ def test_gated_delta_rule(
         output_final_state=True,
         output_h=True,
         auto_cp=auto_cp,
+        output_v_new=qla_output_v_new,
     )
+    if qla_output_v_new:
+        g_qla, A_qla, o_qla, h_qla, s_qla, v_new_qla = qla_fwd_result
+    else:
+        g_qla, A_qla, o_qla, h_qla, s_qla = qla_fwd_result
+        v_new_qla = None
 
     if check_accuracy:
         print(
@@ -291,21 +299,25 @@ def test_gated_delta_rule(
         dht,
         cu_seqlens,
     )
-    dq_fla, dk_fla, dv_fla, db_fla, dg_fla, dh0_fla, _, _ = (
-        chunk_gated_delta_rule_bwd_fla(
-            q,
-            k,
-            v,
-            g_fla,
-            beta,
-            A_fla,
-            scale,
-            h0,
-            do,
-            dht,
-            cu_seqlens,
+    run_fla_bwd = not is_sm12x()
+    if run_fla_bwd:
+        dq_fla, dk_fla, dv_fla, db_fla, dg_fla, dh0_fla, _, _ = (
+            chunk_gated_delta_rule_bwd_fla(
+                q,
+                k,
+                v,
+                g_fla,
+                beta,
+                A_fla,
+                scale,
+                h0,
+                do,
+                dht,
+                cu_seqlens,
+            )
         )
-    )
+    else:
+        dq_fla = dk_fla = dv_fla = db_fla = dg_fla = dh0_fla = None
     dq_qla, dk_qla, dv_qla, db_qla, dg_qla, dh0_qla = chunk_gated_delta_rule_bwd_qla(
         q,
         k,
@@ -318,43 +330,51 @@ def test_gated_delta_rule(
         scale,
         h0,
         cu_seqlens,
+        h=h_qla,
+        v_new=v_new_qla,
     )
 
     if check_accuracy:
-        print(
-            f"dq_fla: {(dq_fla - dq_ref).abs().max().item():.4f} / {dq_ref.abs().max().item():.4f}"
-        )
+        if run_fla_bwd:
+            print(
+                f"dq_fla: {(dq_fla - dq_ref).abs().max().item():.4f} / {dq_ref.abs().max().item():.4f}"
+            )
         print(
             f"dq_qla: {(dq_qla - dq_ref).abs().max().item():.4f} / {dq_ref.abs().max().item():.4f}"
         )
-        print(
-            f"dk_fla: {(dk_fla - dk_ref).abs().max().item():.4f} / {dk_ref.abs().max().item():.4f}"
-        )
+        if run_fla_bwd:
+            print(
+                f"dk_fla: {(dk_fla - dk_ref).abs().max().item():.4f} / {dk_ref.abs().max().item():.4f}"
+            )
         print(
             f"dk_qla: {(dk_qla - dk_ref).abs().max().item():.4f} / {dk_ref.abs().max().item():.4f}"
         )
-        print(
-            f"dv_fla: {(dv_fla - dv_ref).abs().max().item():.4f} / {dv_ref.abs().max().item():.4f}"
-        )
+        if run_fla_bwd:
+            print(
+                f"dv_fla: {(dv_fla - dv_ref).abs().max().item():.4f} / {dv_ref.abs().max().item():.4f}"
+            )
         print(
             f"dv_qla: {(dv_qla - dv_ref).abs().max().item():.4f} / {dv_ref.abs().max().item():.4f}"
         )
-        if dht is not None:
+        if dht is not None and run_fla_bwd:
             print(
                 f"dh0_fla: {(dh0_fla - dh0_ref).abs().max().item():.4f} / {dh0_ref.abs().max().item():.4f}"
             )
+        if dht is not None:
             print(
                 f"dh0_qla: {(dh0_qla - dh0_ref).abs().max().item():.4f} / {dh0_ref.abs().max().item():.4f}"
             )
-        print(
-            f"db_fla: {(db_fla - db_ref).abs().max().item():.4f} / {db_ref.abs().max().item():.4f}"
-        )
+        if run_fla_bwd:
+            print(
+                f"db_fla: {(db_fla - db_ref).abs().max().item():.4f} / {db_ref.abs().max().item():.4f}"
+            )
         print(
             f"db_qla: {(db_qla - db_ref).abs().max().item():.4f} / {db_ref.abs().max().item():.4f}"
         )
-        print(
-            f"dg_fla: {(dg_fla - dg_ref).abs().max().item():.4f} / {dg_ref.abs().max().item():.4f}"
-        )
+        if run_fla_bwd:
+            print(
+                f"dg_fla: {(dg_fla - dg_ref).abs().max().item():.4f} / {dg_ref.abs().max().item():.4f}"
+            )
         print(
             f"dg_qla: {(dg_qla - dg_ref).abs().max().item():.4f} / {dg_ref.abs().max().item():.4f}"
         )
@@ -373,6 +393,8 @@ def test_gated_delta_rule(
                     scale,
                     h0,
                     cu_seqlens,
+                    h=h_qla,
+                    v_new=v_new_qla,
                 )
             )
             try:
@@ -420,43 +442,79 @@ def test_gated_delta_rule(
                 raise e
 
     if show_speedup:
-        prof_fla = profile(
-            chunk_gated_delta_rule_bwd_fla,
-            [q, k, v, g_fla, beta, A_fla, scale, h0, do, dht, cu_seqlens],
-        )
-        prof_qla = profile(
-            chunk_gated_delta_rule_bwd_qla,
-            [q, k, v, g_qla, beta, A_qla, do, dht, scale, h0, cu_seqlens],
-        )
-        result_fla = {
-            "[bwd] csum": prof_fla["chunk_local_cumsum_scalar_kernel"],
-            "[bwd] recom": prof_fla["recompute_w_u_fwd_kernel"]
-            + prof_fla["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"],
-            "[bwd] dv": prof_fla["chunk_bwd_kernel_dv_local"],
-            "[bwd] gdr": prof_fla["chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"],
-            "[bwd] dqkwg": prof_fla["kernel_kernel"],
-            "[bwd] wy": prof_fla["prepare_wy_repr_bwd_kernel"],
-        }
-        result_qla = {
-            "[bwd] csum": prof_qla["tilelang_chunk_local_cumsum_kernel_kernel"],
-            "[bwd] recom": prof_qla["tilelang_prepare_h_kernel_kernel"],
-            "[bwd] gdr": prof_qla["tilelang_fused_chunk_gdr_bwd_kernel_kernel"],
-        }
-        if num_k_heads < num_v_heads:
-            result_fla["[bwd] reduc"] = prof_fla["compress_heads_kernel"]
-            result_qla["[bwd] reduc"] = (
-                prof_qla["tilelang_group_reduce_vector_kernel_kernel"] * 2
+        if run_fla_bwd:
+            prof_fla = profile(
+                chunk_gated_delta_rule_bwd_fla,
+                [q, k, v, g_fla, beta, A_fla, scale, h0, do, dht, cu_seqlens],
             )
-        result_fla["total"] = prof_fla["total"]
-        result_qla["total"] = prof_qla["total"]
-        results = {
-            "fla": result_fla,
-            "flash_qla": result_qla,
+        else:
+            prof_fla = None
+        if h_qla is not None and v_new_qla is not None:
+            def qla_bwd_with_saved_intermediates():
+                return chunk_gated_delta_rule_bwd_qla(
+                    q,
+                    k,
+                    v,
+                    g_qla,
+                    beta,
+                    A_qla,
+                    do,
+                    dht,
+                    scale,
+                    h0,
+                    cu_seqlens,
+                    h=h_qla,
+                    v_new=v_new_qla,
+                )
+
+            prof_qla = profile(qla_bwd_with_saved_intermediates, [])
+        else:
+            prof_qla = profile(
+                chunk_gated_delta_rule_bwd_qla,
+                [q, k, v, g_qla, beta, A_qla, do, dht, scale, h0, cu_seqlens],
+            )
+        result_fla = (
+            {
+                "[bwd] csum": prof_fla["chunk_local_cumsum_scalar_kernel"],
+                "[bwd] recom": prof_fla["recompute_w_u_fwd_kernel"]
+                + prof_fla["chunk_gated_delta_rule_fwd_kernel_h_blockdim64"],
+                "[bwd] dv": prof_fla["chunk_bwd_kernel_dv_local"],
+                "[bwd] gdr": prof_fla[
+                    "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64"
+                ],
+                "[bwd] dqkwg": prof_fla["kernel_kernel"],
+                "[bwd] wy": prof_fla["prepare_wy_repr_bwd_kernel"],
+            }
+            if run_fla_bwd
+            else {}
+        )
+        result_qla = {
+            "[bwd] csum": prof_qla.get("tilelang_chunk_local_cumsum_kernel_kernel"),
+            "[bwd] recom": prof_qla.get("tilelang_prepare_h_kernel_kernel"),
         }
+        if "tilelang_fused_chunk_gdr_bwd_kernel_kernel" in prof_qla:
+            result_qla["[bwd] gdr"] = prof_qla[
+                "tilelang_fused_chunk_gdr_bwd_kernel_kernel"
+            ]
+        else:
+            result_qla["[bwd] decomp"] = prof_qla["total"]
+        if num_k_heads < num_v_heads:
+            if run_fla_bwd:
+                result_fla["[bwd] reduc"] = prof_fla["compress_heads_kernel"]
+            result_qla["[bwd] reduc"] = (
+                prof_qla.get("tilelang_group_reduce_vector_kernel_kernel", 0.0) * 2
+            )
+        if run_fla_bwd:
+            result_fla["total"] = prof_fla["total"]
+        result_qla["total"] = prof_qla["total"]
+        results = {"flash_qla": result_qla}
+        if run_fla_bwd:
+            results = {"fla": result_fla, **results}
         df = pd.DataFrame(results)
         print(df.round(3))
-        speedup = results["fla"]["total"] / results["flash_qla"]["total"]
-        print(f"Speed up: {speedup:2.2f}x")
+        if run_fla_bwd:
+            speedup = results["fla"]["total"] / results["flash_qla"]["total"]
+            print(f"Speed up: {speedup:2.2f}x")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@
 import argparse
 import math
 import gc
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -24,6 +26,7 @@ from flash_qla import (
     chunk_gated_delta_rule_fwd as qla_fwd,
     chunk_gated_delta_rule_bwd as qla_bwd,
 )
+from flash_qla.ops.gated_delta_rule.chunk.arch import is_sm12x
 from flash_qla.utils import l2norm
 
 try:
@@ -35,6 +38,19 @@ except ImportError:
 
 HEAD_DIM = 128
 BWD_SPLIT_SIZE = 8
+
+
+@contextmanager
+def force_fla2_triton_backend():
+    old_value = os.environ.get("FLA_TILELANG")
+    os.environ["FLA_TILELANG"] = "0"
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop("FLA_TILELANG", None)
+        else:
+            os.environ["FLA_TILELANG"] = old_value
 
 
 @dataclass
@@ -375,9 +391,14 @@ def bench_bwd(
 
     g_cumsum = None
     A = None
+    h_qla = None
+    v_new_qla = None
+    g_fla = None
+    A_fla = None
 
-    # Pre-run FWD to get intermediates
+    # Pre-run FWD paths to get each implementation's own intermediates.
     try:
+        save_qla_bwd_intermediates = is_sm12x()
         result = qla_fwd(
             q,
             k,
@@ -387,11 +408,14 @@ def bench_bwd(
             scale=scale,
             initial_state=h0,
             output_final_state=True,
-            output_h=False,
+            output_h=save_qla_bwd_intermediates,
             cu_seqlens=cu_seqlens,
             auto_cp=True,
+            output_v_new=save_qla_bwd_intermediates,
         )
-        if isinstance(result, tuple) and len(result) >= 2:
+        if save_qla_bwd_intermediates and isinstance(result, tuple) and len(result) >= 6:
+            g_cumsum, A, _, h_qla, _, v_new_qla = result
+        elif isinstance(result, tuple) and len(result) >= 2:
             g_cumsum, A = result[0], result[1]
         else:
             raise RuntimeError("FlashQLA FWD did not return expected intermediates")
@@ -399,6 +423,27 @@ def bench_bwd(
         print(f"[FWD Error] Failed at seqlens={seqlens}, heads={h_qk}. Error: {e}")
         cleanup_cuda()
         return float("nan"), float("nan")
+
+    try:
+        with force_fla2_triton_backend():
+            result = fla_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=scale,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+            )
+        if isinstance(result, tuple) and len(result) >= 3:
+            g_fla, A_fla = result[0], result[2]
+        else:
+            raise RuntimeError("FLA2 FWD did not return expected intermediates")
+    except RuntimeError as e:
+        print(f"[FWD Error] FLA2 failed at seqlens={seqlens}, heads={h_qk}. Error: {e}")
+        cleanup_cuda()
 
     results = {}
 
@@ -415,6 +460,8 @@ def bench_bwd(
             scale=scale,
             initial_state=h0,
             cu_seqlens=cu_seqlens,
+            h=h_qla,
+            v_new=v_new_qla,
         )
 
     try:
@@ -426,10 +473,18 @@ def bench_bwd(
         results["flash_qla"] = float("nan")
 
     def call_fla_bwd():
-        return fla_bwd(q, k, v, g_cumsum, beta, A, scale, h0, do, dht, cu_seqlens)
+        with force_fla2_triton_backend():
+            return fla_bwd(
+                q, k, v, g_fla, beta, A_fla, scale, h0, do, dht, cu_seqlens
+            )
 
     try:
-        mean = tilelang.profiler.do_bench(call_fla_bwd, warmup=warmup, rep=repeats)
+        if g_fla is None or A_fla is None:
+            raise RuntimeError("FLA2 FWD intermediates unavailable")
+        with force_fla2_triton_backend():
+            mean = tilelang.profiler.do_bench(
+                call_fla_bwd, warmup=warmup, rep=repeats
+            )
         results["fla"] = mean
     except RuntimeError as e:
         print(f"\n[WARN] FLA Bwd failed: {e}")
@@ -447,7 +502,7 @@ FWD_HDR = (
 
 BWD_HDR = (
     f"{'Heads':<8} {'SeqLen':<15} "
-    f"{'flash_qla [bwd]':>10}  {'FLA [bwd]':>10}   {'Speedup':>8}"
+    f"{'flash_qla [bwd]':>10}  {'FLA2 [bwd]':>10}   {'Speedup':>8}"
 )
 
 

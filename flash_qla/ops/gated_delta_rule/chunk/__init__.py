@@ -11,7 +11,14 @@ from .arch import is_sm12x, is_sm90
 if is_sm90():
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
 elif is_sm12x():
-    from .blackwell import fused_gdr_fwd, kkt_solve
+    from .blackwell import (
+        fused_gdr_fwd,
+        fused_gdr_bwd,
+        fused_gdr_h,
+        is_fla2_bwd_available,
+        kkt_solve,
+        prepare_fla2_bwd_a,
+    )
 else:
     raise ValueError("FlashQLA now supports sm90 and sm12x only.")
 from .cp_context import intra_card_cp_preprocess
@@ -29,6 +36,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool = True,
     output_h: bool = False,
     auto_cp: bool = True,
+    output_v_new: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = kkt_solve(
@@ -50,7 +58,7 @@ def chunk_gated_delta_rule_fwd(
                 raw_cu_seqlens=cu_seqlens,
             )
         )
-    o, h, final_state = fused_gdr_fwd(
+    fwd_kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -66,6 +74,20 @@ def chunk_gated_delta_rule_fwd(
         cp_seq_map=cp_seq_map,
         raw_cu_seqlens=raw_cu_seqlens,
     )
+    if is_sm12x():
+        fwd_kwargs["output_v_new"] = output_v_new
+    elif output_v_new:
+        raise ValueError("output_v_new is only supported on sm12x.")
+    fwd_result = fused_gdr_fwd(**fwd_kwargs)
+    if output_v_new:
+        o, h, final_state, v_new = fwd_result
+    else:
+        o, h, final_state = fwd_result
+        v_new = None
+    if is_sm12x() and is_fla2_bwd_available():
+        A = prepare_fla2_bwd_a(A, g, cu_seqlens=cu_seqlens, chunk_size=64)
+    if output_v_new:
+        return g, A, o, h, final_state, v_new
     return g, A, o, h, final_state
 
 
@@ -81,43 +103,59 @@ def chunk_gated_delta_rule_bwd(
     scale: float | None = None,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
+    h: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
 ):
     if is_sm12x():
-        raise NotImplementedError(
-            "FlashQLA sm12x backward requires a split TileLang kernel; "
-            "the Hopper fused backward kernel exceeds sm120/sm121 shared memory limits."
+        return fused_gdr_bwd(
+            q,
+            k,
+            v,
+            A,
+            g,
+            beta,
+            do,
+            dht,
+            h,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            v_new=v_new,
         )
-
-    h, _, _ = fused_gdr_h(
-        k=k,
-        v=v,
-        a=A,
-        g=g,
-        b=beta,
-        initial_state=initial_state,
-        output_final_state=False,
-        output_h=True,
-        cu_seqlens=cu_seqlens,
-    )
-    dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
-        q=q,
-        k=k,
-        v=v,
-        a=A,
-        g=g,
-        b=beta,
-        do=do,
-        dht=dht,
-        h=h,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
+    else:
+        h, _, _ = fused_gdr_h(
+            k=k,
+            v=v,
+            a=A,
+            g=g,
+            b=beta,
+            initial_state=initial_state,
+            output_final_state=False,
+            output_h=True,
+            cu_seqlens=cu_seqlens,
+        )
+        dq, dk, dv, dg, db, dh0 = fused_gdr_bwd(
+            q=q,
+            k=k,
+            v=v,
+            a=A,
+            g=g,
+            b=beta,
+            do=do,
+            dht=dht,
+            h=h,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
     )
     Hg, H = k.shape[-2], v.shape[-2]
-    if Hg < H:
+    if Hg < H and not is_sm12x():
         dq = group_reduce_vector(dq, Hg)
         dk = group_reduce_vector(dk, Hg)
     assert dg.dtype == torch.float32, "dg should be fp32"
-    dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
+    if not is_sm12x():
+        dg = chunk_local_cumsum(
+            dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens
+        )
     return dq, dk, dv, db, dg, dh0
 
 
@@ -140,7 +178,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         q_orig = q
         k_orig = k
 
-        g, A, o, _, final_state = chunk_gated_delta_rule_fwd(
+        save_bwd_intermediates = is_sm12x() and is_fla2_bwd_available()
+        fwd_result = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -149,18 +188,28 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
-            output_h=False,
+            output_h=save_bwd_intermediates,
             cu_seqlens=cu_seqlens,
+            output_v_new=save_bwd_intermediates,
         )
+        if save_bwd_intermediates:
+            g, A, o, h, final_state, v_new = fwd_result
+        else:
+            g, A, o, h, final_state = fwd_result
+            v_new = None
 
-        ctx.save_for_backward(q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens)
+        ctx.save_for_backward(
+            q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens, h, v_new
+        )
         ctx.scale = scale
         return o.to(q.dtype), final_state
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
-        q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+        q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens, h, v_new = (
+            ctx.saved_tensors
+        )
 
         dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
             q=q_orig,
@@ -174,6 +223,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             scale=ctx.scale,
             initial_state=initial_state,
             cu_seqlens=cu_seqlens,
+            h=h,
+            v_new=v_new,
         )
 
         return (

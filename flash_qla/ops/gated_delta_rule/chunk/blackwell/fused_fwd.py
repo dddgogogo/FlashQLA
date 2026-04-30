@@ -36,6 +36,7 @@ def tilelang_fused_chunk_gdr_fwd(
     store_final_state,
     store_h,
     store_o,
+    store_v_new,
     is_varlen,
     is_cp,
     block_DV=128,
@@ -84,6 +85,7 @@ def tilelang_fused_chunk_gdr_fwd(
         raw_cu_seqlens: T.Tensor([raw_batch_size + 1], dtype=seqlen_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
         h: T.Tensor(h_shape, dtype=h_dtype),
+        v_new: T.Tensor(v_shape, dtype=qkva_dtype),
         ht: T.Tensor(ht_shape, dtype=ht_dtype),
     ):
         with T.Kernel(T.ceildiv(DV, block_DV) * batch_size * H, threads=512) as (bbhv,):
@@ -296,6 +298,18 @@ def tilelang_fused_chunk_gdr_fwd(
                         v_fragment,
                         clear_accum=True,
                     )
+                    if store_v_new:
+                        for j_s, j_v in T.Parallel(block_S, block_DV):
+                            with T.If(
+                                seq_start_idx + i_s * block_S + j_s < seq_end_idx
+                            ):
+                                with T.Then():
+                                    v_new[
+                                        batch_idx,
+                                        seq_start_idx + i_s * block_S + j_s,
+                                        bh,
+                                        bv * block_DV + j_v,
+                                    ] = v_fragment[j_s, j_v]
                     # S2[2] Vd
                     T.copy(v_fragment, vd_shared)
                     T.barrier_arrive(bar_4)
@@ -591,6 +605,7 @@ def fused_gdr_fwd(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
     output_h: bool = False,
+    output_v_new: bool = False,
     output_o: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     cp_seq_map: torch.LongTensor | None = None,
@@ -647,6 +662,7 @@ def fused_gdr_fwd(
             (raw_cu_seqlens.shape[0] - 1, H, K, V), dtype=torch.float32, device=k.device
         )
     o = torch.empty_like(v)
+    v_new = torch.empty_like(v) if output_v_new else v
 
     grid_size = real_batch_size * H
     if grid_size <= 8:
@@ -680,6 +696,7 @@ def fused_gdr_fwd(
         store_final_state=output_final_state,
         store_h=output_h,
         store_o=output_o,
+        store_v_new=output_v_new,
         is_varlen=is_varlen,
         is_cp=is_cp,
         block_DV=block_DV,
@@ -700,6 +717,7 @@ def fused_gdr_fwd(
         raw_cu_seqlens,
         o,
         h,
+        v_new,
         final_state,
     )
 
@@ -710,4 +728,6 @@ def fused_gdr_fwd(
     if not output_o:
         o = None
 
+    if output_v_new:
+        return o, h, final_state, v_new
     return o, h, final_state
