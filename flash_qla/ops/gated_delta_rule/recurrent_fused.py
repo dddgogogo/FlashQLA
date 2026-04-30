@@ -2129,6 +2129,15 @@ def fused_sigmoid_gating_delta_rule_update(
         block_DV = 16
     elif (
         use_regular_kernel
+        and has_tree
+        and cache_intermediate
+        and regular_tokens_per_seq is not None
+        and regular_tokens_per_seq <= 32
+        and num_sequences <= 8
+    ):
+        block_DV = 4
+    elif (
+        use_regular_kernel
         and cache_intermediate
         and regular_tokens_per_seq is not None
         and regular_tokens_per_seq <= 16

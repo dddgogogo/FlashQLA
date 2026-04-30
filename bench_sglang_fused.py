@@ -106,7 +106,9 @@ def run_case(
         if tree:
             parent = torch.zeros(batch, tokens_per_seq, dtype=torch.int32, device="cuda")
             if tokens_per_seq > 1:
-                parent[:, 1:] = torch.arange(tokens_per_seq - 1, dtype=torch.int32, device="cuda")
+                parent[:, 1:] = (
+                    torch.arange(1, tokens_per_seq, dtype=torch.int32, device="cuda") - 1
+                ) // 2
             s_kwargs["retrieve_parent_token"] = parent
             q_kwargs["retrieve_parent_token"] = parent
 
