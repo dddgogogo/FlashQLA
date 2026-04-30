@@ -210,7 +210,7 @@ def main():
     parser.add_argument("--hv", type=int, default=48)
     parser.add_argument("--kdim", type=int, default=128)
     parser.add_argument("--vdim", type=int, default=128)
-    parser.add_argument("--decode-batches", default="1,2,4,8,16,32,64,128")
+    parser.add_argument("--decode-batches", default="1,2,3,4,8,16,64")
     parser.add_argument("--verify-batches", default="1,2,4,8")
     parser.add_argument("--verify-tokens", default="16,32")
     parser.add_argument("--warmup", type=int, default=20)
