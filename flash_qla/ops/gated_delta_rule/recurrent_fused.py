@@ -808,17 +808,28 @@ def tilelang_flashqla_gdn_decode_bv32_warp(
             h_new_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
             q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
             k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
-            exp_g = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta = T.alloc_fragment((32,), dtype=accum_dtype)
-            a_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            b_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            x = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta_x = T.alloc_fragment((32,), dtype=accum_dtype)
-            softplus_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
             local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
             kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
             v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
             o_value = T.alloc_fragment((32,), dtype=accum_dtype)
+
+            a_raw[0] = a[0, bn, bh]
+            b_raw[0] = b[0, bn, bh]
+            x[0] = a_raw[0] + dt_bias[bh]
+            beta_x[0] = softplus_beta * x[0]
+            if beta_x[0] <= softplus_threshold:
+                softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+            else:
+                softplus_x[0] = x[0]
+            exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+            beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
 
             for tx in T.Parallel(32):
                 q_lane_0[tx] = q[0, bn, bhq, tx]
@@ -861,17 +872,6 @@ def tilelang_flashqla_gdn_decode_bv32_warp(
                 q_lane_2[tx] *= scale
                 q_lane_3[tx] *= scale
 
-                a_raw[tx] = a[0, bn, bh]
-                b_raw[tx] = b[0, bn, bh]
-                x[tx] = a_raw[tx] + dt_bias[bh]
-                beta_x[tx] = softplus_beta * x[tx]
-                if beta_x[tx] <= softplus_threshold:
-                    softplus_x[tx] = T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
-                else:
-                    softplus_x[tx] = x[tx]
-                exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
-                beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
-
                 for jv in T.serial(block_DV):
                     h_lane_0[tx] = 0.0
                     h_lane_1[tx] = 0.0
@@ -890,10 +890,10 @@ def tilelang_flashqla_gdn_decode_bv32_warp(
                         h_lane_3[tx] = h0_source[
                             state_idx, bh, bv * block_DV + jv, tx + 96
                         ]
-                    h_lane_0[tx] *= exp_g[tx]
-                    h_lane_1[tx] *= exp_g[tx]
-                    h_lane_2[tx] *= exp_g[tx]
-                    h_lane_3[tx] *= exp_g[tx]
+                    h_lane_0[tx] *= exp_g[0]
+                    h_lane_1[tx] *= exp_g[0]
+                    h_lane_2[tx] *= exp_g[0]
+                    h_lane_3[tx] *= exp_g[0]
                     local_sum[tx] = (
                         h_lane_0[tx] * k_lane_0[tx]
                         + h_lane_1[tx] * k_lane_1[tx]
@@ -904,7 +904,7 @@ def tilelang_flashqla_gdn_decode_bv32_warp(
                     kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
                     v_delta[tx] = (
                         v[0, bn, bh, bv * block_DV + jv] - kv_value[tx]
-                    ) * beta[tx]
+                    ) * beta[0]
 
                     h_new_lane_0[tx] = h_lane_0[tx] + k_lane_0[tx] * v_delta[tx]
                     h_new_lane_1[tx] = h_lane_1[tx] + k_lane_1[tx] * v_delta[tx]
@@ -935,6 +935,215 @@ def tilelang_flashqla_gdn_decode_bv32_warp(
                         o[0, bn, bh, bv * block_DV + jv] = o_value[tx]
 
     return tilelang_flashqla_gdn_decode_bv32_warp_kernel
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def tilelang_flashqla_gdn_decode_bv16_warp(
+    H,
+    HV,
+    DK,
+    DV,
+    scale,
+    softplus_beta,
+    softplus_threshold,
+    q_dtype,
+    k_dtype,
+    v_dtype,
+    a_dtype,
+    b_dtype,
+    a_log_dtype,
+    dt_bias_dtype,
+    state_dtype,
+    indices_dtype,
+    o_dtype,
+    accum_dtype,
+    use_qk_l2norm_in_kernel,
+):
+    total_tokens = T.dynamic("total_tokens")
+    num_sequences = T.dynamic("num_sequences")
+    block_DV = 16
+    num_value_tiles = tilelang.cdiv(DV, block_DV)
+
+    q_shape = (1, total_tokens, H, DK)
+    k_shape = (1, total_tokens, H, DK)
+    v_shape = (1, total_tokens, HV, DV)
+    a_shape = (1, total_tokens, HV)
+    b_shape = (1, total_tokens, HV)
+    o_shape = (1, total_tokens, HV, DV)
+    state_shape = (num_sequences, HV, DV, DK)
+
+    @T.prim_func
+    def tilelang_flashqla_gdn_decode_bv16_warp_kernel(
+        A_log: T.Tensor((HV,), dtype=a_log_dtype),
+        a: T.Tensor(a_shape, dtype=a_dtype),
+        dt_bias: T.Tensor((HV,), dtype=dt_bias_dtype),
+        q: T.Tensor(q_shape, dtype=q_dtype),
+        k: T.Tensor(k_shape, dtype=k_dtype),
+        v: T.Tensor(v_shape, dtype=v_dtype),
+        b: T.Tensor(b_shape, dtype=b_dtype),
+        h0_source: T.Tensor(state_shape, dtype=state_dtype),
+        h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
+        o: T.Tensor(o_shape, dtype=o_dtype),
+    ):
+        with T.Kernel(num_sequences * HV * num_value_tiles, threads=32) as (bid,):
+            bnh = bid // num_value_tiles
+            bv = bid % num_value_tiles
+            bn = bnh // HV
+            bh = bnh % HV
+            bhq = bh // (HV // H)
+
+            state_idx = T.alloc_var("int32")
+            state_idx = h0_indices[bn]
+
+            q_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_0 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_1 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_2 = T.alloc_fragment((32,), dtype=accum_dtype)
+            h_new_lane_3 = T.alloc_fragment((32,), dtype=accum_dtype)
+            q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
+            kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
+            v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
+            o_value = T.alloc_fragment((32,), dtype=accum_dtype)
+
+            a_raw[0] = a[0, bn, bh]
+            b_raw[0] = b[0, bn, bh]
+            x[0] = a_raw[0] + dt_bias[bh]
+            beta_x[0] = softplus_beta * x[0]
+            if beta_x[0] <= softplus_threshold:
+                softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+            else:
+                softplus_x[0] = x[0]
+            exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+            beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
+
+            for tx in T.Parallel(32):
+                q_lane_0[tx] = q[0, bn, bhq, tx]
+                q_lane_1[tx] = q[0, bn, bhq, tx + 32]
+                q_lane_2[tx] = q[0, bn, bhq, tx + 64]
+                q_lane_3[tx] = q[0, bn, bhq, tx + 96]
+                k_lane_0[tx] = k[0, bn, bhq, tx]
+                k_lane_1[tx] = k[0, bn, bhq, tx + 32]
+                k_lane_2[tx] = k[0, bn, bhq, tx + 64]
+                k_lane_3[tx] = k[0, bn, bhq, tx + 96]
+                q_norm[tx] = (
+                    q_lane_0[tx] * q_lane_0[tx]
+                    + q_lane_1[tx] * q_lane_1[tx]
+                    + q_lane_2[tx] * q_lane_2[tx]
+                    + q_lane_3[tx] * q_lane_3[tx]
+                )
+                k_norm[tx] = (
+                    k_lane_0[tx] * k_lane_0[tx]
+                    + k_lane_1[tx] * k_lane_1[tx]
+                    + k_lane_2[tx] * k_lane_2[tx]
+                    + k_lane_3[tx] * k_lane_3[tx]
+                )
+
+                if use_qk_l2norm_in_kernel:
+                    q_norm[tx] = T.warp_reduce_sum(q_norm[tx])
+                    k_norm[tx] = T.warp_reduce_sum(k_norm[tx])
+                    q_norm[tx] = T.rsqrt(q_norm[tx] + 1e-6)
+                    k_norm[tx] = T.rsqrt(k_norm[tx] + 1e-6)
+                    q_lane_0[tx] *= q_norm[tx]
+                    q_lane_1[tx] *= q_norm[tx]
+                    q_lane_2[tx] *= q_norm[tx]
+                    q_lane_3[tx] *= q_norm[tx]
+                    k_lane_0[tx] *= k_norm[tx]
+                    k_lane_1[tx] *= k_norm[tx]
+                    k_lane_2[tx] *= k_norm[tx]
+                    k_lane_3[tx] *= k_norm[tx]
+
+                q_lane_0[tx] *= scale
+                q_lane_1[tx] *= scale
+                q_lane_2[tx] *= scale
+                q_lane_3[tx] *= scale
+
+                for jv in T.serial(block_DV):
+                    h_lane_0[tx] = 0.0
+                    h_lane_1[tx] = 0.0
+                    h_lane_2[tx] = 0.0
+                    h_lane_3[tx] = 0.0
+                    if state_idx >= 0:
+                        h_lane_0[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx
+                        ]
+                        h_lane_1[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 32
+                        ]
+                        h_lane_2[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 64
+                        ]
+                        h_lane_3[tx] = h0_source[
+                            state_idx, bh, bv * block_DV + jv, tx + 96
+                        ]
+                    h_lane_0[tx] *= exp_g[0]
+                    h_lane_1[tx] *= exp_g[0]
+                    h_lane_2[tx] *= exp_g[0]
+                    h_lane_3[tx] *= exp_g[0]
+                    local_sum[tx] = (
+                        h_lane_0[tx] * k_lane_0[tx]
+                        + h_lane_1[tx] * k_lane_1[tx]
+                        + h_lane_2[tx] * k_lane_2[tx]
+                        + h_lane_3[tx] * k_lane_3[tx]
+                    )
+
+                    kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                    v_delta[tx] = (
+                        v[0, bn, bh, bv * block_DV + jv] - kv_value[tx]
+                    ) * beta[0]
+
+                    h_new_lane_0[tx] = h_lane_0[tx] + k_lane_0[tx] * v_delta[tx]
+                    h_new_lane_1[tx] = h_lane_1[tx] + k_lane_1[tx] * v_delta[tx]
+                    h_new_lane_2[tx] = h_lane_2[tx] + k_lane_2[tx] * v_delta[tx]
+                    h_new_lane_3[tx] = h_lane_3[tx] + k_lane_3[tx] * v_delta[tx]
+                    if state_idx >= 0:
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx] = (
+                            h_new_lane_0[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 32] = (
+                            h_new_lane_1[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 64] = (
+                            h_new_lane_2[tx]
+                        )
+                        h0_source[state_idx, bh, bv * block_DV + jv, tx + 96] = (
+                            h_new_lane_3[tx]
+                        )
+                    local_sum[tx] = (
+                        h_new_lane_0[tx] * q_lane_0[tx]
+                        + h_new_lane_1[tx] * q_lane_1[tx]
+                        + h_new_lane_2[tx] * q_lane_2[tx]
+                        + h_new_lane_3[tx] * q_lane_3[tx]
+                    )
+
+                    o_value[tx] = T.warp_reduce_sum(local_sum[tx])
+                    if tx == 0:
+                        o[0, bn, bh, bv * block_DV + jv] = o_value[tx]
+
+    return tilelang_flashqla_gdn_decode_bv16_warp_kernel
 
 
 @tilelang.jit(
@@ -1020,17 +1229,28 @@ def tilelang_flashqla_gdn_decode_bv32x2_warp(
             h_new_lane_3 = T.alloc_fragment((64,), dtype=accum_dtype)
             q_norm = T.alloc_fragment((64,), dtype=accum_dtype)
             k_norm = T.alloc_fragment((64,), dtype=accum_dtype)
-            exp_g = T.alloc_fragment((64,), dtype=accum_dtype)
-            beta = T.alloc_fragment((64,), dtype=accum_dtype)
-            a_raw = T.alloc_fragment((64,), dtype=accum_dtype)
-            b_raw = T.alloc_fragment((64,), dtype=accum_dtype)
-            x = T.alloc_fragment((64,), dtype=accum_dtype)
-            beta_x = T.alloc_fragment((64,), dtype=accum_dtype)
-            softplus_x = T.alloc_fragment((64,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
             local_sum = T.alloc_fragment((64,), dtype=accum_dtype)
             kv_value = T.alloc_fragment((64,), dtype=accum_dtype)
             v_delta = T.alloc_fragment((64,), dtype=accum_dtype)
             o_value = T.alloc_fragment((64,), dtype=accum_dtype)
+
+            a_raw[0] = a[0, bn, bh]
+            b_raw[0] = b[0, bn, bh]
+            x[0] = a_raw[0] + dt_bias[bh]
+            beta_x[0] = softplus_beta * x[0]
+            if beta_x[0] <= softplus_threshold:
+                softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+            else:
+                softplus_x[0] = x[0]
+            exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+            beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
 
             for tx in T.Parallel(64):
                 q_lane_0[tx] = q[0, bn, bhq, tx % 32]
@@ -1073,17 +1293,6 @@ def tilelang_flashqla_gdn_decode_bv32x2_warp(
                 q_lane_2[tx] *= scale
                 q_lane_3[tx] *= scale
 
-                a_raw[tx] = a[0, bn, bh]
-                b_raw[tx] = b[0, bn, bh]
-                x[tx] = a_raw[tx] + dt_bias[bh]
-                beta_x[tx] = softplus_beta * x[tx]
-                if beta_x[tx] <= softplus_threshold:
-                    softplus_x[tx] = T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
-                else:
-                    softplus_x[tx] = x[tx]
-                exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
-                beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
-
                 for jv in T.serial(block_DV):
                     value_offset = bv * value_span + (tx // 32) * block_DV + jv
                     h_lane_0[tx] = 0.0
@@ -1102,10 +1311,10 @@ def tilelang_flashqla_gdn_decode_bv32x2_warp(
                             h_lane_3[tx] = h0_source[
                                 state_idx, bh, value_offset, tx % 32 + 96
                             ]
-                    h_lane_0[tx] *= exp_g[tx]
-                    h_lane_1[tx] *= exp_g[tx]
-                    h_lane_2[tx] *= exp_g[tx]
-                    h_lane_3[tx] *= exp_g[tx]
+                    h_lane_0[tx] *= exp_g[0]
+                    h_lane_1[tx] *= exp_g[0]
+                    h_lane_2[tx] *= exp_g[0]
+                    h_lane_3[tx] *= exp_g[0]
                     local_sum[tx] = (
                         h_lane_0[tx] * k_lane_0[tx]
                         + h_lane_1[tx] * k_lane_1[tx]
@@ -1115,7 +1324,7 @@ def tilelang_flashqla_gdn_decode_bv32x2_warp(
 
                     kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
                     if value_offset < DV:
-                        v_delta[tx] = (v[0, bn, bh, value_offset] - kv_value[tx]) * beta[tx]
+                        v_delta[tx] = (v[0, bn, bh, value_offset] - kv_value[tx]) * beta[0]
 
                         h_new_lane_0[tx] = h_lane_0[tx] + k_lane_0[tx] * v_delta[tx]
                         h_new_lane_1[tx] = h_lane_1[tx] + k_lane_1[tx] * v_delta[tx]
@@ -1222,17 +1431,28 @@ def tilelang_flashqla_gdn_decode_bv16_regular_warp(
             h_lane_3 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
             q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
             k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
-            exp_g = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta = T.alloc_fragment((32,), dtype=accum_dtype)
-            a_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            b_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            x = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta_x = T.alloc_fragment((32,), dtype=accum_dtype)
-            softplus_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
             local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
             kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
             v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
             o_value = T.alloc_fragment((32,), dtype=accum_dtype)
+
+            a_raw[0] = a[0, bn, bh]
+            b_raw[0] = b[0, bn, bh]
+            x[0] = a_raw[0] + dt_bias[bh]
+            beta_x[0] = softplus_beta * x[0]
+            if beta_x[0] <= softplus_threshold:
+                softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+            else:
+                softplus_x[0] = x[0]
+            exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+            beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
 
             for jv in T.serial(block_DV):
                 for tx in T.Parallel(32):
@@ -1295,23 +1515,12 @@ def tilelang_flashqla_gdn_decode_bv16_regular_warp(
                 q_lane_2[tx] *= scale
                 q_lane_3[tx] *= scale
 
-                a_raw[tx] = a[0, bn, bh]
-                b_raw[tx] = b[0, bn, bh]
-                x[tx] = a_raw[tx] + dt_bias[bh]
-                beta_x[tx] = softplus_beta * x[tx]
-                if beta_x[tx] <= softplus_threshold:
-                    softplus_x[tx] = T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
-                else:
-                    softplus_x[tx] = x[tx]
-                exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
-                beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
-
             for jv in T.serial(block_DV):
                 for tx in T.Parallel(32):
-                    h_lane_0[jv, tx] *= exp_g[tx]
-                    h_lane_1[jv, tx] *= exp_g[tx]
-                    h_lane_2[jv, tx] *= exp_g[tx]
-                    h_lane_3[jv, tx] *= exp_g[tx]
+                    h_lane_0[jv, tx] *= exp_g[0]
+                    h_lane_1[jv, tx] *= exp_g[0]
+                    h_lane_2[jv, tx] *= exp_g[0]
+                    h_lane_3[jv, tx] *= exp_g[0]
                     local_sum[tx] = (
                         h_lane_0[jv, tx] * k_lane_0[tx]
                         + h_lane_1[jv, tx] * k_lane_1[tx]
@@ -1322,7 +1531,7 @@ def tilelang_flashqla_gdn_decode_bv16_regular_warp(
                     kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
                     v_delta[tx] = (
                         v[0, bn, bh, bv * block_DV + jv] - kv_value[tx]
-                    ) * beta[tx]
+                    ) * beta[0]
 
                     h_lane_0[jv, tx] += k_lane_0[tx] * v_delta[tx]
                     h_lane_1[jv, tx] += k_lane_1[tx] * v_delta[tx]
@@ -1452,13 +1661,13 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
             h_lane_3 = T.alloc_fragment((block_DV, 32), dtype=accum_dtype)
             q_norm = T.alloc_fragment((32,), dtype=accum_dtype)
             k_norm = T.alloc_fragment((32,), dtype=accum_dtype)
-            exp_g = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta = T.alloc_fragment((32,), dtype=accum_dtype)
-            a_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            b_raw = T.alloc_fragment((32,), dtype=accum_dtype)
-            x = T.alloc_fragment((32,), dtype=accum_dtype)
-            beta_x = T.alloc_fragment((32,), dtype=accum_dtype)
-            softplus_x = T.alloc_fragment((32,), dtype=accum_dtype)
+            exp_g = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta = T.alloc_fragment((1,), dtype=accum_dtype)
+            a_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            b_raw = T.alloc_fragment((1,), dtype=accum_dtype)
+            x = T.alloc_fragment((1,), dtype=accum_dtype)
+            beta_x = T.alloc_fragment((1,), dtype=accum_dtype)
+            softplus_x = T.alloc_fragment((1,), dtype=accum_dtype)
             local_sum = T.alloc_fragment((32,), dtype=accum_dtype)
             kv_value = T.alloc_fragment((32,), dtype=accum_dtype)
             v_delta = T.alloc_fragment((32,), dtype=accum_dtype)
@@ -1487,6 +1696,17 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
 
             for step in T.serial(tokens_per_seq):
                 token_idx = seq_start + step
+
+                a_raw[0] = a[0, token_idx, bh]
+                b_raw[0] = b[0, token_idx, bh]
+                x[0] = a_raw[0] + dt_bias[bh]
+                beta_x[0] = softplus_beta * x[0]
+                if beta_x[0] <= softplus_threshold:
+                    softplus_x[0] = T.log(1.0 + T.exp(beta_x[0])) / softplus_beta
+                else:
+                    softplus_x[0] = x[0]
+                exp_g[0] = T.exp(-T.exp(A_log[bh]) * softplus_x[0])
+                beta[0] = 1.0 / (1.0 + T.exp(-b_raw[0]))
 
                 if has_tree_attention:
                     if step != 0 and cache_idx >= 0:
@@ -1564,25 +1784,12 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
                     q_lane_2[tx] *= scale
                     q_lane_3[tx] *= scale
 
-                    a_raw[tx] = a[0, token_idx, bh]
-                    b_raw[tx] = b[0, token_idx, bh]
-                    x[tx] = a_raw[tx] + dt_bias[bh]
-                    beta_x[tx] = softplus_beta * x[tx]
-                    if beta_x[tx] <= softplus_threshold:
-                        softplus_x[tx] = (
-                            T.log(1.0 + T.exp(beta_x[tx])) / softplus_beta
-                        )
-                    else:
-                        softplus_x[tx] = x[tx]
-                    exp_g[tx] = T.exp(-T.exp(A_log[bh]) * softplus_x[tx])
-                    beta[tx] = 1.0 / (1.0 + T.exp(-b_raw[tx]))
-
                 for jv in T.serial(block_DV):
                     for tx in T.Parallel(32):
-                        h_lane_0[jv, tx] *= exp_g[tx]
-                        h_lane_1[jv, tx] *= exp_g[tx]
-                        h_lane_2[jv, tx] *= exp_g[tx]
-                        h_lane_3[jv, tx] *= exp_g[tx]
+                        h_lane_0[jv, tx] *= exp_g[0]
+                        h_lane_1[jv, tx] *= exp_g[0]
+                        h_lane_2[jv, tx] *= exp_g[0]
+                        h_lane_3[jv, tx] *= exp_g[0]
                         local_sum[tx] = (
                             h_lane_0[jv, tx] * k_lane_0[tx]
                             + h_lane_1[jv, tx] * k_lane_1[tx]
@@ -1593,7 +1800,7 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
                         kv_value[tx] = T.warp_reduce_sum(local_sum[tx])
                         v_delta[tx] = (
                             v[0, token_idx, bh, bv * block_DV + jv] - kv_value[tx]
-                        ) * beta[tx]
+                        ) * beta[0]
 
                         h_lane_0[jv, tx] += k_lane_0[tx] * v_delta[tx]
                         h_lane_1[jv, tx] += k_lane_1[tx] * v_delta[tx]
@@ -2115,7 +2322,7 @@ def fused_sigmoid_gating_delta_rule_update(
         and not has_tree
         and not cache_intermediate
         and not disable_state_update
-        and num_sequences == 4
+        and 2 <= num_sequences <= 4
     ):
         block_DV = 16
     elif (
@@ -2124,9 +2331,9 @@ def fused_sigmoid_gating_delta_rule_update(
         and not has_tree
         and not cache_intermediate
         and not disable_state_update
-        and num_sequences >= 3
+        and 5 <= num_sequences < 16
     ):
-        block_DV = 16
+        block_DV = 4
     elif (
         use_regular_kernel
         and has_tree
@@ -2174,7 +2381,10 @@ def fused_sigmoid_gating_delta_rule_update(
         and not has_tree
         and not disable_state_update
     ):
-        if block_DV == 16 and num_sequences <= 4:
+        if block_DV == 16 and num_sequences == 2:
+            decode_kernel = tilelang_flashqla_gdn_decode_bv16_warp
+            decode_kwargs = {}
+        elif block_DV == 16 and num_sequences <= 4:
             decode_kernel = tilelang_flashqla_gdn_decode_bv16_regular_warp
             decode_kwargs = {"block_DV": 16}
         else:
