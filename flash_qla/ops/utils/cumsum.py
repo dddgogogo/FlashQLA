@@ -10,6 +10,9 @@ from flash_qla.utils import prepare_chunk_indices
 
 @tilelang.jit(
     # out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    },
 )
 def tilelang_chunk_local_cumsum(
     H,
@@ -23,7 +26,6 @@ def tilelang_chunk_local_cumsum(
     data_batch_size = T.dynamic("data_batch_size")
     real_batch_size = T.dynamic("real_batch_size")
     num_tokens = T.dynamic("num_tokens")
-    num_chunks = T.dynamic("num_chunks")
     block_S = chunk_size
 
     g_shape = (data_batch_size, num_tokens, H)
@@ -73,6 +75,7 @@ def tilelang_chunk_local_cumsum(
                     g_cumsum[bb, left + j, i] = gT_fragment[j, i]
 
     if is_varlen:
+        num_chunks = T.dynamic("num_chunks")
 
         @T.prim_func
         def tilelang_chunk_local_cumsum_kernel(

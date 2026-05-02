@@ -5,6 +5,9 @@ import triton
 import triton.language as tl
 
 from flash_qla.ops.utils import chunk_local_cumsum
+from flash_qla.ops.gated_delta_rule.chunk.hopper.fused_bwd import (
+    tilelang_fused_chunk_gdr_bwd,
+)
 from flash_qla.utils import (
     fill_last_chunk_of_g,
     pack,

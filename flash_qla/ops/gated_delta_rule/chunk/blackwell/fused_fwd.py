@@ -13,6 +13,7 @@ TARGET_NUM_CTAS = int(MULTI_PROCESSOR_COUNT * 0.7)
     # out_idx=[-3, -2, -1],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         # tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
 )
@@ -42,6 +43,7 @@ def tilelang_fused_chunk_gdr_fwd(
     block_DV=128,
     num_stages=2,
     use_set_max_nreg=True,
+    transpose_state_layout=False,
 ):
     batch_size = T.dynamic("batch_size")
     num_tokens = T.dynamic("num_tokens")
@@ -67,8 +69,16 @@ def tilelang_fused_chunk_gdr_fwd(
         g_shape = (batch_size, num_tokens, H)
         b_shape = (batch_size, num_tokens, H)
         h_shape = (batch_size, num_chunks, H, DK, DV)
-    h0_shape = (batch_size, H, DK, DV)
-    ht_shape = (raw_batch_size, H, DK, DV)
+    h0_shape = (
+        (batch_size, H, DV, DK)
+        if transpose_state_layout
+        else (batch_size, H, DK, DV)
+    )
+    ht_shape = (
+        (raw_batch_size, H, DV, DK)
+        if transpose_state_layout
+        else (raw_batch_size, H, DK, DV)
+    )
 
     @T.prim_func
     def tilelang_fused_chunk_gdr_fwd_kernel(
@@ -138,9 +148,7 @@ def tilelang_fused_chunk_gdr_fwd(
 
             o_shared = T.alloc_shared((block_S, block_DV), dtype=o_dtype)
             h_shared = T.alloc_shared((DK, block_DV), dtype=qkva_dtype)
-            vd_shared = T.alloc_shared((block_S, block_DV), dtype=qkva_dtype)
             vn_shared = T.alloc_shared((block_S, block_DV), dtype=qkva_dtype)
-            p_shared = T.alloc_shared((block_S, block_S), dtype=qkva_dtype)
             g_exp_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
             g_rev_exp_shared = T.alloc_shared(
                 (block_S), dtype=accum_dtype, scope="shared"
@@ -151,7 +159,6 @@ def tilelang_fused_chunk_gdr_fwd(
             v_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             u_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             p_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
-            a_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             g_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             g_last_local = T.alloc_local((1), dtype=accum_dtype)
 
@@ -181,10 +188,16 @@ def tilelang_fused_chunk_gdr_fwd(
 
                 # Initialize S
                 if use_initial_state:
-                    T.copy(
-                        h0[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
-                        h_fragment,
-                    )
+                    if transpose_state_layout:
+                        for j_k, j_v in T.Parallel(DK, block_DV):
+                            h_fragment[j_k, j_v] = h0[
+                                bb, bh, bv * block_DV + j_v, j_k
+                            ]
+                    else:
+                        T.copy(
+                            h0[bb, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV],
+                            h_fragment,
+                        )
                 else:
                     T.clear(h_fragment)
 
@@ -226,12 +239,18 @@ def tilelang_fused_chunk_gdr_fwd(
 
                 # Store final S
                 if need_store_final_state:
-                    T.copy(
-                        h_fragment,
-                        ht[
-                            raw_batch_idx, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV
-                        ],
-                    )
+                    if transpose_state_layout:
+                        for j_k, j_v in T.Parallel(DK, block_DV):
+                            ht[raw_batch_idx, bh, bv * block_DV + j_v, j_k] = (
+                                h_fragment[j_k, j_v]
+                            )
+                    else:
+                        T.copy(
+                            h_fragment,
+                            ht[
+                                raw_batch_idx, bh, 0:DK, bv * block_DV : (bv + 1) * block_DV
+                            ],
+                        )
 
             elif tx < 256:
                 if use_set_max_nreg:
@@ -269,32 +288,25 @@ def tilelang_fused_chunk_gdr_fwd(
 
                     # [STAGE 0] 1
                     T.barrier_wait(bar_1, i_s % 2)
-                    # U = K @ S
+                    # [STAGE 0] 3
+                    T.barrier_wait(bar_3, i_s % 2)
+                    # Compute beta * (V - exp(g) * (K @ S)) first, then apply A.
+                    # This is algebraically equivalent to FLA's
+                    # U - W @ S formulation while saving one A @ (...) GEMM.
                     T.gemm_v1(
                         k_shared[i_s % num_stages, :, :],
                         h_shared,
                         u_fragment,
                         clear_accum=True,
                     )
-
-                    # [STAGE 0] 2
-                    # W = V - g * U
                     for j_s, j_v in T.Parallel(block_S, block_DV):
-                        u_fragment[j_s, j_v] *= -g_exp_shared[j_s]
-                    for j_s, j_v in T.Parallel(block_S, block_DV):
-                        u_fragment[j_s, j_v] += v_shared[
-                            i_s % num_stages, j_s, j_v
-                        ]
-                    # S2[V] W
-                    for j_s, j_v in T.Parallel(block_S, block_DV):
-                        v_shared[i_s % num_stages, j_s, j_v] = u_fragment[j_s, j_v]
-
-                    # [STAGE 0] 3
-                    T.barrier_wait(bar_3, i_s % 2)
-                    # Vd = Ag @ W
+                        vn_shared[j_s, j_v] = (
+                            v_shared[i_s % num_stages, j_s, j_v]
+                            - u_fragment[j_s, j_v] * g_exp_shared[j_s]
+                        ) * b_shared[i_s % num_stages, j_s]
                     T.gemm_v1(
                         a_shared[i_s % num_stages, :, :],
-                        v_shared[i_s % num_stages, :, :],
+                        vn_shared,
                         v_fragment,
                         clear_accum=True,
                     )
@@ -310,8 +322,8 @@ def tilelang_fused_chunk_gdr_fwd(
                                         bh,
                                         bv * block_DV + j_v,
                                     ] = v_fragment[j_s, j_v]
-                    # S2[2] Vd
-                    T.copy(v_fragment, vd_shared)
+                    # Reuse V's shared tile for Vd after original V is consumed.
+                    T.copy(v_fragment, v_shared[i_s % num_stages, :, :])
                     T.barrier_arrive(bar_4)
 
                     # [STAGE 0] 4
@@ -364,17 +376,9 @@ def tilelang_fused_chunk_gdr_fwd(
                             )
                         else:
                             g_fragment[j_s, j_t] = 0
-                    # Ag = G * Ar * b
-                    for j_s, j_t in T.Parallel(block_S, block_S):
-                        a_fragment[j_s, j_t] = a_shared[
-                            i_s % num_stages, j_s, j_t
-                        ]
-                    for j_s, j_t in T.Parallel(block_S, block_S):
-                        a_fragment[j_s, j_t] *= g_fragment[j_s, j_t]
-                    for j_s, j_t in T.Parallel(block_S, block_S):
-                        a_fragment[j_s, j_t] *= b_shared[i_s % num_stages, j_t]
-                    for j_s, j_t in T.Parallel(block_S, block_S):
-                        a_shared[i_s % num_stages, j_s, j_t] = a_fragment[j_s, j_t]
+                    # a_shared is already the gated triangular inverse from
+                    # kkt_solve, matching FLA's chunk_fwd_intra. Only Pg uses
+                    # the explicit lower-triangular gate matrix below.
 
                     # [STAGE 0] 2
                     T.barrier_wait(bar_1, i_s % 2)
@@ -390,17 +394,23 @@ def tilelang_fused_chunk_gdr_fwd(
                     # Pg = s * G * P
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         p_fragment[j_s, j_t] *= scale * g_fragment[j_s, j_t]
-                    # S1[1] Pg
-                    T.copy(p_fragment, p_shared)
                     T.barrier_arrive(bar_3)
                     # O = s * g * O
-                    for j_s, j_k in T.Parallel(block_S, DK):
-                        o_fragment[j_s, j_k] *= scale * g_exp_shared[j_s]
+                    for j_s, j_v in T.Parallel(block_S, block_DV):
+                        o_fragment[j_s, j_v] *= scale * g_exp_shared[j_s]
 
                     # [STAGE 0] 4
                     T.barrier_wait(bar_4, i_s % 2)
+                    # Reuse A's shared tile for Pg after the V consumer has
+                    # finished reading A for this stage.
+                    T.copy(p_fragment, a_shared[i_s % num_stages, :, :])
                     # O += Pg @ Vd
-                    T.gemm_v1(p_shared, vd_shared, o_fragment, clear_accum=False)
+                    T.gemm_v1(
+                        a_shared[i_s % num_stages, :, :],
+                        v_shared[i_s % num_stages, :, :],
+                        o_fragment,
+                        clear_accum=False,
+                    )
                     T.barrier_arrive(bar_5)
 
                     # [STAGE 0] 5
@@ -426,15 +436,33 @@ def tilelang_fused_chunk_gdr_fwd(
                         right = left + block_S
 
                         # Load Q
-                        T.copy(
-                            q[batch_idx, left:right, bhg, 0:DK],
-                            q_shared[i_s % num_stages, :, :],
-                        )
+                        if right <= seq_end_idx:
+                            T.copy(
+                                q[batch_idx, left:right, bhg, 0:DK],
+                                q_shared[i_s % num_stages, :, :],
+                            )
+                        else:
+                            for j_s, j_k in T.Parallel(block_S, DK):
+                                if left + j_s < seq_end_idx:
+                                    q_shared[i_s % num_stages, j_s, j_k] = q[
+                                        batch_idx, left + j_s, bhg, j_k
+                                    ]
+                                else:
+                                    q_shared[i_s % num_stages, j_s, j_k] = 0
                         # Load K
-                        T.copy(
-                            k[batch_idx, left:right, bhg, 0:DK],
-                            k_shared[i_s % num_stages, :, :],
-                        )
+                        if right <= seq_end_idx:
+                            T.copy(
+                                k[batch_idx, left:right, bhg, 0:DK],
+                                k_shared[i_s % num_stages, :, :],
+                            )
+                        else:
+                            for j_s, j_k in T.Parallel(block_S, DK):
+                                if left + j_s < seq_end_idx:
+                                    k_shared[i_s % num_stages, j_s, j_k] = k[
+                                        batch_idx, left + j_s, bhg, j_k
+                                    ]
+                                else:
+                                    k_shared[i_s % num_stages, j_s, j_k] = 0
 
                         T.barrier_arrive(data_is_ready[i_s % num_stages])
 
@@ -448,15 +476,27 @@ def tilelang_fused_chunk_gdr_fwd(
                         right = left + block_S
 
                         # Load V
-                        T.copy(
-                            v[
-                                batch_idx,
-                                left:right,
-                                bh,
-                                bv * block_DV : (bv + 1) * block_DV,
-                            ],
-                            v_shared[i_s % num_stages, :, :],
-                        )
+                        if right <= seq_end_idx:
+                            T.copy(
+                                v[
+                                    batch_idx,
+                                    left:right,
+                                    bh,
+                                    bv * block_DV : (bv + 1) * block_DV,
+                                ],
+                                v_shared[i_s % num_stages, :, :],
+                            )
+                        else:
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                if left + j_s < seq_end_idx:
+                                    v_shared[i_s % num_stages, j_s, j_v] = v[
+                                        batch_idx,
+                                        left + j_s,
+                                        bh,
+                                        bv * block_DV + j_v,
+                                    ]
+                                else:
+                                    v_shared[i_s % num_stages, j_s, j_v] = 0
                         # Load beta
                         if right <= seq_end_idx:
                             for j_s in T.Parallel(block_S):
@@ -484,10 +524,19 @@ def tilelang_fused_chunk_gdr_fwd(
                         right = left + block_S
 
                         # Load A
-                        T.copy(
-                            a[batch_idx, left:right, bh, 0:block_S],
-                            a_shared[i_s % num_stages, :, :],
-                        )
+                        if right <= seq_end_idx:
+                            T.copy(
+                                a[batch_idx, left:right, bh, 0:block_S],
+                                a_shared[i_s % num_stages, :, :],
+                            )
+                        else:
+                            for j_s, j_t in T.Parallel(block_S, block_S):
+                                if left + j_s < seq_end_idx:
+                                    a_shared[i_s % num_stages, j_s, j_t] = a[
+                                        batch_idx, left + j_s, bh, j_t
+                                    ]
+                                else:
+                                    a_shared[i_s % num_stages, j_s, j_t] = 0
                         # Load gamma
                         if right <= seq_end_idx:
                             for j_s in T.Parallel(block_S):
@@ -610,6 +659,7 @@ def fused_gdr_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     cp_seq_map: torch.LongTensor | None = None,
     raw_cu_seqlens: torch.LongTensor | None = None,
+    transpose_state_layout: bool = False,
     chunk_size: int = 64,
 ):
     batch_size, num_tokens, Hg, K = k.shape
@@ -646,20 +696,35 @@ def fused_gdr_fwd(
 
     use_initial_state = initial_state is not None
     if initial_state is None:
+        initial_state_shape = (
+            (real_batch_size, H, V, K)
+            if transpose_state_layout
+            else (real_batch_size, H, K, V)
+        )
         initial_state = torch.empty(
-            (real_batch_size, H, K, V), dtype=torch.float32, device=k.device
+            initial_state_shape, dtype=torch.float32, device=k.device
         )
     h = torch.empty((batch_size, num_chunks, H, K, V), dtype=k.dtype, device=k.device)
     if raw_cu_seqlens is None:
         raw_cu_seqlens = torch.empty(
             (real_batch_size + 1,), dtype=seqlen_dtype, device=k.device
         )
+        final_state_shape = (
+            (real_batch_size, H, V, K)
+            if transpose_state_layout
+            else (real_batch_size, H, K, V)
+        )
         final_state = torch.empty(
-            (real_batch_size, H, K, V), dtype=torch.float32, device=k.device
+            final_state_shape, dtype=torch.float32, device=k.device
         )
     else:
+        final_state_shape = (
+            (raw_cu_seqlens.shape[0] - 1, H, V, K)
+            if transpose_state_layout
+            else (raw_cu_seqlens.shape[0] - 1, H, K, V)
+        )
         final_state = torch.empty(
-            (raw_cu_seqlens.shape[0] - 1, H, K, V), dtype=torch.float32, device=k.device
+            final_state_shape, dtype=torch.float32, device=k.device
         )
     o = torch.empty_like(v)
     v_new = torch.empty_like(v) if output_v_new else v
@@ -669,7 +734,7 @@ def fused_gdr_fwd(
         block_DV = 8
         num_stages = 2
     elif grid_size <= 32:
-        block_DV = 32
+        block_DV = 16
         num_stages = 1
     else:
         block_DV = 64
@@ -702,6 +767,7 @@ def fused_gdr_fwd(
         block_DV=block_DV,
         num_stages=num_stages,
         use_set_max_nreg=use_set_max_nreg,
+        transpose_state_layout=transpose_state_layout,
     )
     tilelang_fused_chunk_gdr_fwd_kernel(
         q,

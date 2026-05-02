@@ -9,6 +9,7 @@ from flash_qla.utils import prepare_chunk_offsets
     # out_idx=[-5, -4, -3, -2, -1],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK: True,
     },
 )
@@ -57,7 +58,7 @@ def tilelang_fused_chunk_gdr_bwd(
 
     @T.prim_func
     def tilelang_fused_chunk_gdr_bwd_kernel(
-        do: T.Tensor(o_shape, dtype=o_dtype),
+        do_grad: T.Tensor(o_shape, dtype=o_dtype),
         dht: T.Tensor(ht_shape, dtype=accum_dtype),
         q: T.Tensor(q_shape, dtype=qkva_dtype),
         k: T.Tensor(k_shape, dtype=qkva_dtype),
@@ -251,7 +252,7 @@ def tilelang_fused_chunk_gdr_bwd(
                     a_shared[j_s, j_t] = 0
             for j_s, j_v in T.Parallel(block_S, DV):
                 if seq_start_idx + (num_iters - 1) * block_S + j_s < seq_end_idx:
-                    do_shared[j_s, j_v] = do[
+                    do_shared[j_s, j_v] = do_grad[
                         batch_idx,
                         seq_start_idx + (num_iters - 1) * block_S + j_s,
                         bh,
@@ -852,7 +853,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         T.barrier_wait(bar_14, (i_s + 0) % 2)
                         T.copy(a[batch_idx, left:right, bh, 0:block_S], a_shared)
 
-                        T.copy(do[batch_idx, left:right, bh, 0:DV], do_shared)
+                        T.copy(do_grad[batch_idx, left:right, bh, 0:DV], do_shared)
 
                         T.barrier_wait(bar_15, (i_s + 0) % 2)
                         for j_s in T.Parallel(block_S):

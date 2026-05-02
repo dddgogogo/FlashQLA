@@ -17,7 +17,6 @@ elif is_sm12x():
         fused_gdr_h,
         is_fla2_bwd_available,
         kkt_solve,
-        prepare_fla2_bwd_a,
     )
 else:
     raise ValueError("FlashQLA now supports sm90 and sm12x only.")
@@ -37,13 +36,13 @@ def chunk_gated_delta_rule_fwd(
     output_h: bool = False,
     auto_cp: bool = True,
     output_v_new: bool = False,
+    transpose_state_layout: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    A = kkt_solve(
-        k=k,
-        b=beta,
-        cu_seqlens=cu_seqlens,
-    )
+    kkt_kwargs = dict(k=k, b=beta, cu_seqlens=cu_seqlens)
+    if is_sm12x():
+        kkt_kwargs["g"] = g
+    A = kkt_solve(**kkt_kwargs)
     cp_seq_map = None
     raw_cu_seqlens = None
     if auto_cp:
@@ -73,6 +72,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         cp_seq_map=cp_seq_map,
         raw_cu_seqlens=raw_cu_seqlens,
+        transpose_state_layout=transpose_state_layout,
     )
     if is_sm12x():
         fwd_kwargs["output_v_new"] = output_v_new
@@ -84,8 +84,6 @@ def chunk_gated_delta_rule_fwd(
     else:
         o, h, final_state = fwd_result
         v_new = None
-    if is_sm12x() and is_fla2_bwd_available():
-        A = prepare_fla2_bwd_a(A, g, cu_seqlens=cu_seqlens, chunk_size=64)
     if output_v_new:
         return g, A, o, h, final_state, v_new
     return g, A, o, h, final_state
@@ -105,9 +103,18 @@ def chunk_gated_delta_rule_bwd(
     cu_seqlens: torch.LongTensor | None = None,
     h: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    transpose_state_layout: bool = False,
 ):
+    internal_initial_state = initial_state
+    internal_dht = dht
+    if transpose_state_layout:
+        if initial_state is not None:
+            internal_initial_state = initial_state.transpose(-1, -2).contiguous()
+        if dht is not None:
+            internal_dht = dht.transpose(-1, -2).contiguous()
+
     if is_sm12x():
-        return fused_gdr_bwd(
+        dq, dk, dv, db, dg, dh0 = fused_gdr_bwd(
             q,
             k,
             v,
@@ -115,13 +122,16 @@ def chunk_gated_delta_rule_bwd(
             g,
             beta,
             do,
-            dht,
+            internal_dht,
             h,
             scale=scale,
             cu_seqlens=cu_seqlens,
-            initial_state=initial_state,
+            initial_state=internal_initial_state,
             v_new=v_new,
         )
+        if transpose_state_layout and dh0 is not None:
+            dh0 = dh0.transpose(-1, -2).contiguous()
+        return dq, dk, dv, db, dg, dh0
     else:
         h, _, _ = fused_gdr_h(
             k=k,
@@ -129,7 +139,7 @@ def chunk_gated_delta_rule_bwd(
             a=A,
             g=g,
             b=beta,
-            initial_state=initial_state,
+            initial_state=internal_initial_state,
             output_final_state=False,
             output_h=True,
             cu_seqlens=cu_seqlens,
@@ -142,7 +152,7 @@ def chunk_gated_delta_rule_bwd(
             g=g,
             b=beta,
             do=do,
-            dht=dht,
+            dht=internal_dht,
             h=h,
             scale=scale,
             cu_seqlens=cu_seqlens,
@@ -156,6 +166,8 @@ def chunk_gated_delta_rule_bwd(
         dg = chunk_local_cumsum(
             dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens
         )
+    if transpose_state_layout and dh0 is not None:
+        dh0 = dh0.transpose(-1, -2).contiguous()
     return dq, dk, dv, db, dg, dh0
 
 
@@ -174,6 +186,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        transpose_state_layout: bool = False,
     ):
         q_orig = q
         k_orig = k
@@ -191,6 +204,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_h=save_bwd_intermediates,
             cu_seqlens=cu_seqlens,
             output_v_new=save_bwd_intermediates,
+            transpose_state_layout=transpose_state_layout,
         )
         if save_bwd_intermediates:
             g, A, o, h, final_state, v_new = fwd_result
@@ -202,6 +216,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens, h, v_new
         )
         ctx.scale = scale
+        ctx.transpose_state_layout = transpose_state_layout
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -225,6 +240,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             h=h,
             v_new=v_new,
+            transpose_state_layout=ctx.transpose_state_layout,
         )
 
         return (
@@ -235,6 +251,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             db.to(beta),
             None,
             dh0,
+            None,
             None,
             None,
             None,
@@ -254,6 +271,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
+    transpose_state_layout: bool = False,
 ):
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, (
@@ -294,6 +312,7 @@ def chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        transpose_state_layout,
     )
 
     return o, final_state

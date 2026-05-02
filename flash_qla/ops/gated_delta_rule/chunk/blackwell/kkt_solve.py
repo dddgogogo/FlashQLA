@@ -11,7 +11,7 @@ from flash_qla.utils import prepare_chunk_indices
     # out_idx=[-1],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-        # tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         # tilelang.PassConfigKey.TL_ENABLE_ASYNC_COPY: True,
     },
 )
@@ -48,6 +48,7 @@ def tilelang_kkt_solve(
         seq_start_idx,
         seq_end_idx,
         k,
+        g,
         b,
         a,
     ):
@@ -55,6 +56,7 @@ def tilelang_kkt_solve(
         right = left + block_S
 
         k_shared = T.alloc_shared((block_S, DK), dtype=qkva_dtype)
+        g_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
         b_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
         a64_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
 
@@ -96,12 +98,15 @@ def tilelang_kkt_solve(
             if right <= seq_end_idx:
                 for j_s in T.Parallel(block_S):
                     b_shared[j_s] = b[bb, left + j_s, bh]
+                    g_shared[j_s] = g[bb, left + j_s, bh]
             else:
                 for j_s in T.Parallel(block_S):
                     if left + j_s < seq_end_idx:
                         b_shared[j_s] = b[bb, left + j_s, bh]
+                        g_shared[j_s] = g[bb, left + j_s, bh]
                     else:
                         b_shared[j_s] = 0
+                        g_shared[j_s] = 0
 
             T.barrier_wait(k_is_ready, 0)
 
@@ -110,16 +115,25 @@ def tilelang_kkt_solve(
                 k_shared, k_shared, a64_fragment, transpose_B=True, clear_accum=True
             )
 
-            # A = b * A
+            # A = I + StrictLower(beta_i * exp(g_i - g_j) * K_i @ K_j^T).
+            # FLA applies the gate before solving the triangular system; doing
+            # it after inversion is not algebraically equivalent and corrupts
+            # the final recurrent state on real model activations.
             for j_s, j_t in T.Parallel(block_S, block_S):
-                a64_fragment[j_s, j_t] *= b_shared[j_s]
-
-            # A = I + StrictLower(A)
-            for j_s, j_t in T.Parallel(block_S, block_S):
-                if j_s < j_t:
+                if left + j_s >= seq_end_idx or left + j_t >= seq_end_idx:
+                    if j_s == j_t:
+                        a64_fragment[j_s, j_t] = 1
+                    else:
+                        a64_fragment[j_s, j_t] = 0
+                elif j_s < j_t:
                     a64_fragment[j_s, j_t] = 0
                 elif j_s == j_t:
                     a64_fragment[j_s, j_t] = 1
+                else:
+                    a64_fragment[j_s, j_t] *= (
+                        b_shared[j_s]
+                        * T.exp2((g_shared[j_s] - g_shared[j_t]) * 1.442695)
+                    )
 
             # Prepare inversion input
             for j_s, j_t in T.Parallel(block_S, block_S):
@@ -202,7 +216,14 @@ def tilelang_kkt_solve(
 
             if tx < 128 + 32:
                 # Load K
-                T.copy(k[bb, left:right, bhg, 0:DK], k_shared)
+                if right <= seq_end_idx:
+                    T.copy(k[bb, left:right, bhg, 0:DK], k_shared)
+                else:
+                    for j_s, j_k in T.Parallel(block_S, DK):
+                        if left + j_s < seq_end_idx:
+                            k_shared[j_s, j_k] = k[bb, left + j_s, bhg, j_k]
+                        else:
+                            k_shared[j_s, j_k] = 0
 
                 T.barrier_arrive(k_is_ready)
 
@@ -227,6 +248,7 @@ def tilelang_kkt_solve(
         @T.prim_func
         def tilelang_kkt_solve_kernel(
             k: T.Tensor(k_shape, dtype=qkva_dtype),
+            g: T.Tensor(b_shape, dtype=accum_dtype),
             b: T.Tensor(b_shape, dtype=b_dtype),
             cu_seqlens: T.Tensor([real_batch_size + 1], dtype=seqlen_dtype),
             chunk_indices: T.Tensor([num_chunks, 2], dtype=seqlen_dtype),
@@ -257,6 +279,7 @@ def tilelang_kkt_solve(
                     seq_start_idx,
                     seq_end_idx,
                     k,
+                    g,
                     b,
                     a,
                 )
@@ -266,6 +289,7 @@ def tilelang_kkt_solve(
         @T.prim_func
         def tilelang_kkt_solve_kernel(
             k: T.Tensor(k_shape, dtype=qkva_dtype),
+            g: T.Tensor(b_shape, dtype=accum_dtype),
             b: T.Tensor(b_shape, dtype=b_dtype),
             a: T.Tensor(a_shape, dtype=qkva_dtype),
             num_chunks: T.int32,
@@ -295,6 +319,7 @@ def tilelang_kkt_solve(
                     seq_start_idx,
                     seq_end_idx,
                     k,
+                    g,
                     b,
                     a,
                 )
@@ -304,6 +329,7 @@ def tilelang_kkt_solve(
 
 def kkt_solve(
     k: torch.Tensor,
+    g: torch.Tensor,
     b: torch.Tensor,
     chunk_size: int = 64,
     cu_seqlens: Optional[torch.LongTensor] = None,
@@ -339,8 +365,8 @@ def kkt_solve(
         use_set_max_nreg=False,
     )
     if is_varlen:
-        tilelang_kkt_solve_kernel(k, b, cu_seqlens, chunk_indices, a)
+        tilelang_kkt_solve_kernel(k, g, b, cu_seqlens, chunk_indices, a)
     else:
-        tilelang_kkt_solve_kernel(k, b, a, num_chunks)
+        tilelang_kkt_solve_kernel(k, g, b, a, num_chunks)
 
     return a

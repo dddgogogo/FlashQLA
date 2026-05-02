@@ -524,6 +524,21 @@ def main():
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--mode", choices=["fwd", "bwd", "all"], default="all")
     parser.add_argument("--skip-fi", action="store_true")
+    parser.add_argument(
+        "--server-27b",
+        action="store_true",
+        help="run only the ling-llm 27B prompt-prefill shape: 1x4096, h_qk=16, h_v=48",
+    )
+    parser.add_argument(
+        "--only-model",
+        action="append",
+        help="filter forward model labels; may be passed multiple times",
+    )
+    parser.add_argument(
+        "--only-seqlen",
+        action="append",
+        help="filter forward seqlen labels; may be passed multiple times",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -533,6 +548,22 @@ def main():
     global HAS_FI
     if args.skip_fi:
         HAS_FI = False
+
+    fwd_model_configs = FWD_MODEL_CONFIGS
+    fwd_seqlen_configs = FWD_SEQLEN_CONFIGS
+    if args.server_27b:
+        fwd_model_configs = [cfg for cfg in fwd_model_configs if cfg.label == "27B TP1"]
+        fwd_seqlen_configs = [
+            cfg for cfg in fwd_seqlen_configs if cfg.label == "1x4096"
+        ]
+        if args.mode == "all":
+            args.mode = "fwd"
+    if args.only_model:
+        wanted = set(args.only_model)
+        fwd_model_configs = [cfg for cfg in fwd_model_configs if cfg.label in wanted]
+    if args.only_seqlen:
+        wanted = set(args.only_seqlen)
+        fwd_seqlen_configs = [cfg for cfg in fwd_seqlen_configs if cfg.label in wanted]
 
     gpu_name = torch.cuda.get_device_properties(0).name
     print(f"GPU: {gpu_name}")
@@ -553,12 +584,12 @@ def main():
         print("-" * len(FWD_HDR))
 
         prev_model = None
-        for cfg in FWD_MODEL_CONFIGS:
+        for cfg in fwd_model_configs:
             if prev_model is not None and cfg.label != prev_model:
                 print()
             prev_model = cfg.label
 
-            for sl_cfg in FWD_SEQLEN_CONFIGS:
+            for sl_cfg in fwd_seqlen_configs:
                 try:
                     qla_ms, fi_ms, fla_ms = bench_fwd(
                         sl_cfg.seqlens,
