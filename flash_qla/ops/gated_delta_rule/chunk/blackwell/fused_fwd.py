@@ -149,6 +149,8 @@ def tilelang_fused_chunk_gdr_fwd(
             o_shared = T.alloc_shared((block_S, block_DV), dtype=o_dtype)
             h_shared = T.alloc_shared((DK, block_DV), dtype=qkva_dtype)
             vn_shared = T.alloc_shared((block_S, block_DV), dtype=qkva_dtype)
+            if use_initial_state:
+                w_shared = T.alloc_shared((block_S, 64), dtype=qkva_dtype)
             g_exp_shared = T.alloc_shared((block_S), dtype=accum_dtype, scope="shared")
             g_rev_exp_shared = T.alloc_shared(
                 (block_S), dtype=accum_dtype, scope="shared"
@@ -158,6 +160,8 @@ def tilelang_fused_chunk_gdr_fwd(
             o_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             v_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             u_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
+            if use_initial_state:
+                w_fragment = T.alloc_fragment((block_S, 64), dtype=accum_dtype)
             p_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             g_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             g_last_local = T.alloc_local((1), dtype=accum_dtype)
@@ -290,26 +294,104 @@ def tilelang_fused_chunk_gdr_fwd(
                     T.barrier_wait(bar_1, i_s % 2)
                     # [STAGE 0] 3
                     T.barrier_wait(bar_3, i_s % 2)
-                    # Compute beta * (V - exp(g) * (K @ S)) first, then apply A.
-                    # This is algebraically equivalent to FLA's
-                    # U - W @ S formulation while saving one A @ (...) GEMM.
-                    T.gemm_v1(
-                        k_shared[i_s % num_stages, :, :],
-                        h_shared,
-                        u_fragment,
-                        clear_accum=True,
-                    )
-                    for j_s, j_v in T.Parallel(block_S, block_DV):
-                        vn_shared[j_s, j_v] = (
-                            v_shared[i_s % num_stages, j_s, j_v]
-                            - u_fragment[j_s, j_v] * g_exp_shared[j_s]
-                        ) * b_shared[i_s % num_stages, j_s]
-                    T.gemm_v1(
-                        a_shared[i_s % num_stages, :, :],
-                        vn_shared,
-                        v_fragment,
-                        clear_accum=True,
-                    )
+                    if use_initial_state:
+                        if g_shared[i_s % num_stages, block_S - 1] == 0:
+                            # No-decay heads are sensitive because state magnitude
+                            # grows across chunks. Match FLA's WY rounding order:
+                            # materialize U and W in BF16, then compute U - W @ S.
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                vn_shared[j_s, j_v] = (
+                                    v_shared[i_s % num_stages, j_s, j_v]
+                                    * b_shared[i_s % num_stages, j_s]
+                                )
+                            T.gemm_v1(
+                                a_shared[i_s % num_stages, :, :],
+                                vn_shared,
+                                v_fragment,
+                                clear_accum=True,
+                            )
+                            T.copy(v_fragment, v_shared[i_s % num_stages, :, :])
+                            T.copy(v_shared[i_s % num_stages, :, :], v_fragment)
+
+                            T.clear(u_fragment)
+                            for j_s, j_k in T.Parallel(block_S, 64):
+                                w_shared[j_s, j_k] = (
+                                    k_shared[i_s % num_stages, j_s, j_k]
+                                    * b_shared[i_s % num_stages, j_s]
+                                    * g_exp_shared[j_s]
+                                )
+                            T.gemm_v1(
+                                a_shared[i_s % num_stages, :, :],
+                                w_shared,
+                                w_fragment,
+                                clear_accum=True,
+                            )
+                            T.copy(w_fragment, w_shared)
+                            T.gemm_v1(
+                                w_shared,
+                                h_shared[0:64, :],
+                                u_fragment,
+                                clear_accum=False,
+                            )
+                            for j_s, j_k in T.Parallel(block_S, 64):
+                                w_shared[j_s, j_k] = (
+                                    k_shared[i_s % num_stages, j_s, 64 + j_k]
+                                    * b_shared[i_s % num_stages, j_s]
+                                    * g_exp_shared[j_s]
+                                )
+                            T.gemm_v1(
+                                a_shared[i_s % num_stages, :, :],
+                                w_shared,
+                                w_fragment,
+                                clear_accum=True,
+                            )
+                            T.copy(w_fragment, w_shared)
+                            T.copy(h_shared[64:128, :], vn_shared)
+                            T.gemm_v1(
+                                w_shared,
+                                vn_shared,
+                                u_fragment,
+                                clear_accum=False,
+                            )
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                v_fragment[j_s, j_v] -= u_fragment[j_s, j_v]
+                        else:
+                            T.gemm_v1(
+                                k_shared[i_s % num_stages, :, :],
+                                h_shared,
+                                u_fragment,
+                                clear_accum=True,
+                            )
+                            for j_s, j_v in T.Parallel(block_S, block_DV):
+                                vn_shared[j_s, j_v] = (
+                                    v_shared[i_s % num_stages, j_s, j_v]
+                                    - u_fragment[j_s, j_v] * g_exp_shared[j_s]
+                                ) * b_shared[i_s % num_stages, j_s]
+                            T.gemm_v1(
+                                a_shared[i_s % num_stages, :, :],
+                                vn_shared,
+                                v_fragment,
+                                clear_accum=True,
+                            )
+                    else:
+                        T.gemm_v1(
+                            k_shared[i_s % num_stages, :, :],
+                            h_shared,
+                            u_fragment,
+                            clear_accum=True,
+                        )
+                        for j_s, j_v in T.Parallel(block_S, block_DV):
+                            vn_shared[j_s, j_v] = (
+                                v_shared[i_s % num_stages, j_s, j_v]
+                                - u_fragment[j_s, j_v] * g_exp_shared[j_s]
+                            ) * b_shared[i_s % num_stages, j_s]
+                        T.gemm_v1(
+                            a_shared[i_s % num_stages, :, :],
+                            vn_shared,
+                            v_fragment,
+                            clear_accum=True,
+                        )
+
                     if store_v_new:
                         for j_s, j_v in T.Parallel(block_S, block_DV):
                             with T.If(
