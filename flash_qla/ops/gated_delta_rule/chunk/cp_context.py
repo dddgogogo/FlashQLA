@@ -89,6 +89,13 @@ def _calc_cp_seqs(
 
     Be = sum(num_chunks) / max(num_chunks)
     use_cp = Be * H <= 40 or (Be * H <= 56 and max(num_chunks) >= 128)
+    if is_sm12x() and H >= 48:
+        # GB10/sm121 has fewer SMs and a much smaller dynamic shared-memory
+        # ceiling than Hopper.  For Qwen3.6 27B TP1 (Hv=48), splitting a
+        # single long sequence into intra-card CP partitions under-utilizes
+        # each partition and is slower than the direct fused forward path on
+        # the local target shape.
+        use_cp = False
 
     if use_cp:
         cp_cu_seqlens = torch.tensor(

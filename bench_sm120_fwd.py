@@ -50,16 +50,23 @@ def make_inputs(batch, tokens, h_k, h_v, dim, seed):
     return q, k, v, g, beta, scale, h0
 
 
+def parse_token_count(raw):
+    value = raw.strip().lower()
+    if value.endswith("k"):
+        return int(value[:-1]) * 1024
+    return int(value)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", type=str, default="2048,8192,32768")
-    parser.add_argument("--heads", type=int, default=32)
-    parser.add_argument("--k-heads", type=int, default=0)
-    parser.add_argument("--v-heads", type=int, default=0)
+    parser.add_argument("--tokens", type=str, default="4096,8192,20k,32k,64k,128k")
+    parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument("--k-heads", type=int, default=16)
+    parser.add_argument("--v-heads", type=int, default=48)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--compare-no-cp", action="store_true")
     args = parser.parse_args()
@@ -74,16 +81,38 @@ def main():
     h_k = args.k_heads or args.heads
     h_v = args.v_heads or args.heads
 
-    for tokens in [int(x) for x in args.tokens.split(",") if x]:
+    for tokens in [parse_token_count(x) for x in args.tokens.split(",") if x]:
         q, k, v, g, beta, scale, h0 = make_inputs(
             args.batch, tokens, h_k, h_v, args.dim, 42 + tokens
         )
 
         def run_fla(q, k, v, g, beta, scale, h0):
-            return fla_fwd(q, k, v, g, beta, scale, h0, True, None)
+            return fla_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=None,
+            )
 
         def run_qla(q, k, v, g, beta, scale, h0):
-            return qla_fwd(q, k, v, g, beta, scale, h0, None, True, False, True)
+            return qla_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=h0,
+                cu_seqlens=None,
+                output_final_state=True,
+                output_h=False,
+                auto_cp=True,
+            )
 
         fla_times = bench(run_fla, (q, k, v, g, beta, scale, h0), args.warmup, args.iters)
         qla_times = bench(run_qla, (q, k, v, g, beta, scale, h0), args.warmup, args.iters)
@@ -92,7 +121,19 @@ def main():
         no_cp_text = ""
         if args.compare_no_cp:
             def run_qla_no_cp(q, k, v, g, beta, scale, h0):
-                return qla_fwd(q, k, v, g, beta, scale, h0, None, True, False, False)
+                return qla_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    scale=scale,
+                    initial_state=h0,
+                    cu_seqlens=None,
+                    output_final_state=True,
+                    output_h=False,
+                    auto_cp=False,
+                )
 
             qla_no_cp_times = bench(
                 run_qla_no_cp,
