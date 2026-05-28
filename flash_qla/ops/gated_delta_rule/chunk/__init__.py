@@ -17,6 +17,8 @@ elif is_sm12x():
         fused_gdr_h,
         is_fla2_bwd_available,
         kkt_solve,
+        prepare_fla2_bwd_a,
+        prepare_fla2_bwd_w,
     )
 else:
     raise ValueError("FlashQLA now supports sm90 and sm12x only.")
@@ -37,6 +39,7 @@ def chunk_gated_delta_rule_fwd(
     auto_cp: bool = True,
     output_v_new: bool = False,
     transpose_state_layout: bool = False,
+    output_w: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     kkt_kwargs = dict(k=k, b=beta, cu_seqlens=cu_seqlens)
@@ -84,6 +87,24 @@ def chunk_gated_delta_rule_fwd(
     else:
         o, h, final_state = fwd_result
         v_new = None
+    w = None
+    if is_sm12x() and is_fla2_bwd_available():
+        A = prepare_fla2_bwd_a(A, g, cu_seqlens=cu_seqlens, chunk_size=64)
+        if output_w:
+            w = prepare_fla2_bwd_w(
+                k=k,
+                beta=beta,
+                a=A,
+                g=g,
+                cu_seqlens=cu_seqlens,
+                chunk_size=64,
+            )
+    elif output_w:
+        raise ValueError("output_w is only supported on sm12x with FLA2 backward.")
+    if output_w:
+        if output_v_new:
+            return g, A, o, h, final_state, v_new, w
+        return g, A, o, h, final_state, w
     if output_v_new:
         return g, A, o, h, final_state, v_new
     return g, A, o, h, final_state
@@ -104,6 +125,7 @@ def chunk_gated_delta_rule_bwd(
     h: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
     transpose_state_layout: bool = False,
+    w: torch.Tensor | None = None,
 ):
     internal_initial_state = initial_state
     internal_dht = dht
@@ -128,6 +150,7 @@ def chunk_gated_delta_rule_bwd(
             cu_seqlens=cu_seqlens,
             initial_state=internal_initial_state,
             v_new=v_new,
+            w=w,
         )
         if transpose_state_layout and dh0 is not None:
             dh0 = dh0.transpose(-1, -2).contiguous()
@@ -205,15 +228,27 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             output_v_new=save_bwd_intermediates,
             transpose_state_layout=transpose_state_layout,
+            output_w=save_bwd_intermediates,
         )
         if save_bwd_intermediates:
-            g, A, o, h, final_state, v_new = fwd_result
+            g, A, o, h, final_state, v_new, w = fwd_result
         else:
             g, A, o, h, final_state = fwd_result
             v_new = None
+            w = None
 
         ctx.save_for_backward(
-            q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens, h, v_new
+            q_orig,
+            k_orig,
+            v,
+            g,
+            beta,
+            A,
+            initial_state,
+            cu_seqlens,
+            h,
+            v_new,
+            w,
         )
         ctx.scale = scale
         ctx.transpose_state_layout = transpose_state_layout
@@ -222,9 +257,19 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor):
-        q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens, h, v_new = (
-            ctx.saved_tensors
-        )
+        (
+            q_orig,
+            k_orig,
+            v,
+            g,
+            beta,
+            A,
+            initial_state,
+            cu_seqlens,
+            h,
+            v_new,
+            w,
+        ) = ctx.saved_tensors
 
         dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
             q=q_orig,
@@ -241,6 +286,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             h=h,
             v_new=v_new,
             transpose_state_layout=ctx.transpose_state_layout,
+            w=w,
         )
 
         return (
