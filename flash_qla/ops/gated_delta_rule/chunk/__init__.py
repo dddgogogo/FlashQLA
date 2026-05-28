@@ -17,7 +17,6 @@ elif is_sm12x():
         fused_gdr_h,
         is_fla2_bwd_available,
         kkt_solve,
-        prepare_fla2_bwd_a,
         prepare_fla2_bwd_w,
     )
 else:
@@ -89,7 +88,6 @@ def chunk_gated_delta_rule_fwd(
         v_new = None
     w = None
     if is_sm12x() and is_fla2_bwd_available():
-        A = prepare_fla2_bwd_a(A, g, cu_seqlens=cu_seqlens, chunk_size=64)
         if output_w:
             w = prepare_fla2_bwd_w(
                 k=k,
