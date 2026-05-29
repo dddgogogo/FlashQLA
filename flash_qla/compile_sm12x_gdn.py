@@ -91,6 +91,111 @@ def patch_tilelang_nvrtc_scalar_params() -> None:
     NVRTCKernelAdapter._flashqla_scalar_param_patch = True
 
 
+# Cubin arch (e.g. "sm_121a" / "sm_120f") the nvcc compile should target. Set
+# from --cubin-arch by main() so it matches kernel-jit's family-suffix policy
+# (compiler.rs::arch_with_family_suffix). None => derive from the current torch
+# device, applying the same 120->120f / 12x->12xa rule.
+_FLASHQLA_CUBIN_ARCH: str | None = None
+
+
+def _resolve_cubin_arch() -> str:
+    """Resolve the nvcc cubin arch, preferring an explicit --cubin-arch.
+
+    Mirrors kernel-jit's `arch_with_family_suffix`: a TRUE sm_120 part wants the
+    arch-FAMILY suffix `120f` (forward-compatible Blackwell-consumer), while
+    sm_12x (x>0, e.g. GB10 / DGX Spark sm_121) wants the arch-SPECIFIC `121a`.
+    The previous unconditional `sm_{cc}a` mislabeled a real sm_120 cubin as
+    `120a`, which kernel-jit (expecting `120f`) then could not load.
+    """
+    if _FLASHQLA_CUBIN_ARCH:
+        return _FLASHQLA_CUBIN_ARCH
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    n = major * 10 + minor
+    if major == 12 and n == 120:
+        return "sm_120f"
+    return f"sm_{n}a"
+
+
+def patch_tilelang_use_nvcc() -> None:
+    """Route TileLang's generated-source .cu -> cubin compile through nvcc
+    instead of NVRTC, while keeping the NVRTC *adapter* (so the launcher
+    metadata extraction in export_tilelang_kernel, the cubin loader, and the
+    dynamic-shape patch above are all unchanged).
+
+    NVRTC cannot compile warp-shuffle reductions (`tl::warp_reduce_sum`), which
+    silently forced the slow shared-memory recurrent kernel (general
+    `tilelang_flashqla_gdn_update`, 128-thread + per-step block barrier) to be
+    deployed instead of the warp-specialized kernel. nvcc compiles them. The
+    produced cubin loads via cuModuleLoadData identically.
+
+    Scope: this is installed ONLY by the recurrent compile entry points (the
+    warp kernel is the only kernel that needs nvcc). The chunk / chunk_bwd
+    kernels stay on the proven in-process NVRTC path so their finite-diff
+    numerical validation (and the cumsum kernel that deliberately omits
+    fast-math) is unchanged. Set FLASHQLA_COMPILE_BACKEND=nvrtc to skip the
+    patch (the warp kernel will then fail loudly under NVRTC rather than
+    silently degrade).
+    """
+    if os.environ.get("FLASHQLA_COMPILE_BACKEND", "nvcc").lower() != "nvcc":
+        return
+
+    from tilelang.contrib import nvcc as _nvcc
+    from tilelang.jit.adapter.nvrtc import libgen as _libgen
+
+    if getattr(_libgen, "_flashqla_nvcc_patch", False):
+        return
+
+    # Preflight: nvcc + a host C++ compiler must be reachable from this process's
+    # PATH (the JIT child inherits the ling-llm service env). Fail with a clear,
+    # actionable message instead of a deep nvcc/Python traceback when a stripped
+    # systemd PATH drops /usr/bin or build-essential is missing.
+    if shutil.which("nvcc") is None:
+        raise RuntimeError(
+            "FlashQLA recurrent warp compile needs nvcc on PATH (set PATH to include "
+            "/usr/local/cuda/bin, or CUDA_HOME). Set FLASHQLA_COMPILE_BACKEND=nvrtc only "
+            "to debug (the warp kernel will then fail to compile)."
+        )
+    # Pin the host compiler explicitly. tilelang's nvcc.compile_cuda passes no
+    # -ccbin, so nvcc otherwise locates g++/gcc purely via the (service) PATH —
+    # a stripped systemd `Environment=PATH=...` that drops /usr/bin makes the
+    # host step fail with "gcc: No such file or directory". Honor
+    # FLASHQLA_HOST_CXX, else the first c++/g++ on PATH.
+    host_cxx = os.environ.get("FLASHQLA_HOST_CXX") or shutil.which("c++") or shutil.which("g++")
+    if host_cxx is None:
+        raise RuntimeError(
+            "FlashQLA recurrent warp compile needs a host C++ compiler (g++/c++) on PATH "
+            "or FLASHQLA_HOST_CXX set — install build-essential and ensure /usr/bin is on the "
+            "service PATH."
+        )
+
+    def _nvcc_compile_cuda(code, target_format="ptx", arch=None, options=None, verbose=False):
+        if arch is None:
+            arch = _resolve_cubin_arch()
+        # Use TileLang's own nvcc option builder (correct -I for tl templates /
+        # cutlass / cuda include + -std=c++17). The NVRTC-oriented `options`
+        # libgen passes point -I directly at cccl/cuda/std, which breaks CUDA 13
+        # host-std resolution under a device --cubin compile ("global scope has
+        # no memcpy"); default_compile_options uses the parent CUDA include so
+        # cccl sets up its own host-std shim. relaxed-constexpr + fast-math match
+        # the kernel-jit wrapper compile.
+        extra = ["--expt-relaxed-constexpr", "--use_fast_math"]
+        if host_cxx:
+            extra += ["-ccbin", host_cxx]
+        opts = _nvcc.default_compile_options(extra)
+        return _nvcc.compile_cuda(
+            code, target_format=target_format, arch=arch, options=opts, verbose=verbose
+        )
+
+    _libgen.compile_cuda = _nvcc_compile_cuda
+    _libgen._flashqla_nvcc_patch = True
+    print(
+        f"FlashQLA: routing TileLang cubin compile through nvcc "
+        f"(warp kernels; arch={_resolve_cubin_arch()}, ccbin={host_cxx})"
+    )
+
+
 def require_sm12x() -> str:
     import torch
 
@@ -312,6 +417,7 @@ def compile_recurrent_update(
     head_k_dim: int,
     head_v_dim: int,
     *,
+    tokens_per_seq: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
     has_tree_attention: bool,
@@ -319,15 +425,36 @@ def compile_recurrent_update(
 ):
     import torch
 
+    # The warp kernel hard-unrolls exactly 4 lanes (tx, +32, +64, +96 = 128 K
+    # values per warp); it does NOT derive the lane count from head_k_dim. Calling
+    # the factory directly bypasses the dispatcher's K==128 guard
+    # (recurrent_fused.py), so assert here — otherwise K<128 reads OOB and K>128
+    # silently truncates the recurrent state.
+    if head_k_dim != 128 or head_v_dim != 128:
+        raise ValueError(
+            "FlashQLA warp recurrent kernel requires head_k_dim==head_v_dim==128 "
+            f"(got K={head_k_dim}, V={head_v_dim})"
+        )
+
     mod = load_source_module(
         "recurrent_fused",
         "flash_qla/ops/gated_delta_rule/recurrent_fused.py",
     )
-    return mod.tilelang_flashqla_gdn_update(
+    # Warp-specialized recurrent kernel (32-thread, compile-time-unrolled
+    # `tokens_per_seq`, warp-shuffle reductions, no shared-mem tree reduction and
+    # no per-step block barrier). ~40x faster than the general
+    # `tilelang_flashqla_gdn_update` at the fixed DFlash shapes (decode T=1,
+    # verify T=verify_q_len). tokens_per_seq is baked in, so decode and verify
+    # get distinct cubins. block_dv=4 keeps the launch grid identical to the
+    # general kernel (num_value_tiles=ceil(DV/4)); only the in-cubin thread count
+    # (128 -> 32) and reduction strategy change. Requires the nvcc compile path
+    # (patch_tilelang_use_nvcc) — NVRTC rejects the warp-shuffle reductions.
+    return mod.tilelang_flashqla_gdn_regular_bv32_warp(
         num_key_heads,
         num_value_heads,
         head_k_dim,
         head_v_dim,
+        tokens_per_seq,
         1.0 / head_k_dim**0.5,
         1.0,
         20.0,
@@ -717,21 +844,44 @@ def compile_chunk_bwd_entries(args: argparse.Namespace, base_cfg: dict[str, int]
     ]
 
 
-def compile_recurrent_entries(args: argparse.Namespace):
-    print("Compiling sm12x FlashQLA recurrent GDN kernels...")
+# (export, tokens_per_seq, disable_state_update, cache_intermediate, has_tree, block_dv)
+# decode is single-token; verify/verify_tree process the fixed DFlash verify_q_len
+# rows. tokens_per_seq is baked into the warp cubin, so decode (always 1) and
+# verify (verify_q_len) MUST live in separate modules with separate identities —
+# a verify_tree compiled at tokens_per_seq=1 dead-code-eliminates retrieve_parent_token
+# and would fail the Rust ABI param check that aborts the whole module load.
+def _recurrent_decode_export(_args: argparse.Namespace):
+    return (EXPORT_RECURRENT_DECODE, 1, False, False, False, 4)
+
+
+def _recurrent_verify_exports(args: argparse.Namespace):
+    if args.verify_q_len < 2:
+        # tokens_per_seq=1 prunes the tree branch (retrieve_parent_token); the
+        # verify module is only meaningful for a real DFlash round (verify_q_len
+        # = tree_budget + 1 >= 2). Decode is the single-token path.
+        raise ValueError(
+            f"--verify-q-len must be >= 2 for the recurrent verify module "
+            f"(got {args.verify_q_len}); decode uses the recurrent_decode module"
+        )
+    return [
+        (EXPORT_RECURRENT_VERIFY, args.verify_q_len, True, True, False, 4),
+        (EXPORT_RECURRENT_VERIFY_TREE, args.verify_q_len, True, True, True, 4),
+    ]
+
+
+def _emit_recurrent_exports(args: argparse.Namespace, recurrent_exports):
+    # The warp recurrent kernel needs the nvcc compile path (NVRTC rejects the
+    # warp-shuffle reductions). Install it here — NOT globally — so chunk /
+    # chunk_bwd keep the proven NVRTC path (and their non-fast-math cumsum).
+    patch_tilelang_use_nvcc()
     recurrent_base_cfg = {
         "H": args.num_key_heads,
         "HV": args.num_value_heads,
         "K": args.head_k_dim,
         "V": args.head_v_dim,
     }
-    recurrent_exports = [
-        (EXPORT_RECURRENT_DECODE, False, False, False, 4),
-        (EXPORT_RECURRENT_VERIFY, True, True, False, 4),
-        (EXPORT_RECURRENT_VERIFY_TREE, True, True, True, 4),
-    ]
     entries = []
-    for export_name, disable_state_update, cache_intermediate, has_tree, block_dv in recurrent_exports:
+    for export_name, tokens_per_seq, disable_state_update, cache_intermediate, has_tree, block_dv in recurrent_exports:
         entries.append(
             export_tilelang_kernel(
                 args.output_dir,
@@ -741,6 +891,7 @@ def compile_recurrent_entries(args: argparse.Namespace):
                     args.num_value_heads,
                     args.head_k_dim,
                     args.head_v_dim,
+                    tokens_per_seq=tokens_per_seq,
                     disable_state_update=disable_state_update,
                     cache_intermediate_states=cache_intermediate,
                     has_tree_attention=has_tree,
@@ -749,6 +900,7 @@ def compile_recurrent_entries(args: argparse.Namespace):
                 config_kwargs={
                     **recurrent_base_cfg,
                     "BV": block_dv,
+                    "TOKENS_PER_SEQ": tokens_per_seq,
                     "DISABLE_STATE_UPDATE": int(disable_state_update),
                     "CACHE_INTERMEDIATE": int(cache_intermediate),
                     "TREE": int(has_tree),
@@ -756,6 +908,27 @@ def compile_recurrent_entries(args: argparse.Namespace):
             )
         )
     return entries
+
+
+def compile_recurrent_decode_entries(args: argparse.Namespace):
+    print("Compiling sm12x FlashQLA recurrent GDN decode kernel...")
+    return _emit_recurrent_exports(args, [_recurrent_decode_export(args)])
+
+
+def compile_recurrent_verify_entries(args: argparse.Namespace):
+    print("Compiling sm12x FlashQLA recurrent GDN verify kernels...")
+    return _emit_recurrent_exports(args, _recurrent_verify_exports(args))
+
+
+def compile_recurrent_entries(args: argparse.Namespace):
+    # Combined decode + verify + verify_tree (for `--mode recurrent`/`all`). The
+    # production path uses the split recurrent_decode / recurrent_verify modes so
+    # decode (vq-independent, prewarmed at boot) and verify (vq-keyed, loaded at
+    # drafter-attach) are distinct modules.
+    print("Compiling sm12x FlashQLA recurrent GDN kernels...")
+    return _emit_recurrent_exports(
+        args, [_recurrent_decode_export(args), *_recurrent_verify_exports(args)]
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -773,9 +946,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-v-dim", type=int, default=128)
     parser.add_argument("--num-key-heads", type=int, default=16)
     parser.add_argument("--num-value-heads", type=int, default=16)
+    # DFlash verify row count (tree_budget + 1). The warp-specialized recurrent
+    # kernel bakes tokens_per_seq at compile time, so verify/verify_tree cubins
+    # are specialized to this; decode is always tokens_per_seq=1.
+    parser.add_argument("--verify-q-len", type=int, default=17)
+    # nvcc cubin arch (e.g. "sm_121a" / "sm_120f"). The Ling-RL kernel-jit runner
+    # passes its own family-suffix-resolved arch so the recurrent warp cubin is
+    # named/targeted exactly like the wrapper-compiled kernels. Absent => derive
+    # from the current torch device (applying the 120->120f / 12x->12xa rule).
+    parser.add_argument("--cubin-arch", type=str, default=None)
     parser.add_argument(
         "--mode",
-        choices=["chunk", "chunk_bwd", "recurrent", "all"],
+        choices=[
+            "chunk",
+            "chunk_bwd",
+            "recurrent",
+            "recurrent_decode",
+            "recurrent_verify",
+            "all",
+        ],
         default="chunk",
     )
     parser.add_argument("--manifest-name")
@@ -791,7 +980,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    global _ROOT
+    global _ROOT, _FLASHQLA_CUBIN_ARCH
     args = parse_args()
     if args.flashqla_path is not None:
         _ROOT = args.flashqla_path.expanduser().resolve()
@@ -802,6 +991,7 @@ def main() -> None:
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     setup_tilelang_env(args.output_dir)
+    _FLASHQLA_CUBIN_ARCH = args.cubin_arch
 
     import torch
 
@@ -809,6 +999,9 @@ def main() -> None:
     arch = require_sm12x()
     patch_tilelang_compat()
     patch_tilelang_nvrtc_scalar_params()
+    # NOTE: patch_tilelang_use_nvcc() is installed ONLY by the recurrent compile
+    # entry points (the warp kernel is the sole nvcc-requiring kernel) — NOT here
+    # globally — so chunk / chunk_bwd stay on the proven NVRTC path.
     print(f"Compiling FlashQLA GDN kernels for {arch} from {_ROOT}")
 
     base_cfg = {
@@ -825,6 +1018,10 @@ def main() -> None:
         entries.extend(compile_chunk_entries(args, base_cfg))
     if args.mode in {"chunk_bwd", "all"}:
         entries.extend(compile_chunk_bwd_entries(args, base_cfg))
+    if args.mode == "recurrent_decode":
+        entries.extend(compile_recurrent_decode_entries(args))
+    if args.mode == "recurrent_verify":
+        entries.extend(compile_recurrent_verify_entries(args))
     if args.mode in {"recurrent", "all"}:
         entries.extend(compile_recurrent_entries(args))
 
@@ -832,6 +1029,8 @@ def main() -> None:
         "chunk": "flashqla_gdn_chunk",
         "chunk_bwd": "flashqla_gdn_chunk_bwd",
         "recurrent": "flashqla_gdn_recurrent",
+        "recurrent_decode": "flashqla_gdn_recurrent_decode",
+        "recurrent_verify": "flashqla_gdn_recurrent_verify",
         "all": "flashqla_gdn",
     }[args.mode]
     write_manifest(args.output_dir, manifest_name, entries)
