@@ -11,14 +11,10 @@ from .arch import is_sm12x, is_sm90
 if is_sm90():
     from .hopper import fused_gdr_fwd, fused_gdr_bwd, fused_gdr_h, kkt_solve
 elif is_sm12x():
-    from .blackwell import (
-        fused_gdr_fwd,
-        fused_gdr_bwd,
-        fused_gdr_h,
-        is_fla2_bwd_available,
-        kkt_solve,
-        prepare_fla2_bwd_w,
-    )
+    # sm12x is 100% pure TileLang: the backward never touches FLA, so the
+    # FLA-coupled fused_gdr_bwd / is_fla2_bwd_available / prepare_fla2_bwd_w are
+    # intentionally NOT imported here (the module was deleted).
+    from .blackwell import fused_gdr_fwd, fused_gdr_h, kkt_solve
 else:
     raise ValueError("FlashQLA now supports sm90 and sm12x only.")
 from .cp_context import intra_card_cp_preprocess
@@ -38,7 +34,6 @@ def chunk_gated_delta_rule_fwd(
     auto_cp: bool = True,
     output_v_new: bool = False,
     transpose_state_layout: bool = False,
-    output_w: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     kkt_kwargs = dict(k=k, b=beta, cu_seqlens=cu_seqlens)
@@ -86,23 +81,6 @@ def chunk_gated_delta_rule_fwd(
     else:
         o, h, final_state = fwd_result
         v_new = None
-    w = None
-    if is_sm12x() and is_fla2_bwd_available():
-        if output_w:
-            w = prepare_fla2_bwd_w(
-                k=k,
-                beta=beta,
-                a=A,
-                g=g,
-                cu_seqlens=cu_seqlens,
-                chunk_size=64,
-            )
-    elif output_w:
-        raise ValueError("output_w is only supported on sm12x with FLA2 backward.")
-    if output_w:
-        if output_v_new:
-            return g, A, o, h, final_state, v_new, w
-        return g, A, o, h, final_state, w
     if output_v_new:
         return g, A, o, h, final_state, v_new
     return g, A, o, h, final_state
@@ -123,7 +101,6 @@ def chunk_gated_delta_rule_bwd(
     h: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
     transpose_state_layout: bool = False,
-    w: torch.Tensor | None = None,
 ):
     internal_initial_state = initial_state
     internal_dht = dht
@@ -134,21 +111,34 @@ def chunk_gated_delta_rule_bwd(
             internal_dht = dht.transpose(-1, -2).contiguous()
 
     if is_sm12x():
-        dq, dk, dv, db, dg, dh0 = fused_gdr_bwd(
-            q,
-            k,
-            v,
-            A,
-            g,
-            beta,
-            do,
-            internal_dht,
-            h,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            initial_state=internal_initial_state,
-            v_new=v_new,
-            w=w,
+        # sm12x backward is 100% pure TileLang (no FLA, no fla/qla precision
+        # mixing). Covers the production case (dht=None, incl. packed/varlen)
+        # AND the final-state-gradient case (dht!=None, non-varlen) via the pure
+        # dh recurrence seeded from dht. Requires the recompute intermediates h
+        # and v_new from the forward (always saved on sm12x).
+        if h is None or v_new is None:
+            raise RuntimeError(
+                "sm12x pure backward requires the forward's h and v_new "
+                "intermediates (output_h/output_v_new); they were not provided."
+            )
+        # dht (final-state grad) seeds the recurrence; dh0 (initial-state grad)
+        # is produced only when an initial_state was supplied. Neither has a
+        # pure path under varlen, and FLA is intentionally not used on sm12x.
+        if cu_seqlens is not None and (
+            internal_dht is not None or internal_initial_state is not None
+        ):
+            raise NotImplementedError(
+                "sm12x backward does not support dht / initial_state gradients "
+                "together with packed/varlen sequences (no pure-TileLang path; "
+                "FLA is not used on sm12x)."
+            )
+        from .blackwell.bwd_sm12x import chunk_gated_delta_rule_bwd_sm12x
+
+        scale = scale if scale is not None else k.shape[-1] ** -0.5
+        dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd_sm12x(
+            q, k, v, g, beta, A, do, h, v_new, scale, chunk_size=64,
+            cu_seqlens=cu_seqlens, dht=internal_dht,
+            output_dh0=internal_initial_state is not None,
         )
         if transpose_state_layout and dh0 is not None:
             dh0 = dh0.transpose(-1, -2).contiguous()
@@ -212,7 +202,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         q_orig = q
         k_orig = k
 
-        save_bwd_intermediates = is_sm12x() and is_fla2_bwd_available()
+        # On sm12x the backward is the 100% pure-TileLang decomposed path, which
+        # needs the forward's h and v_new (it recomputes w itself). Save those on
+        # every sm12x device — no FLA, no fla/qla precision mixing.
+        save_pure_bwd = is_sm12x()
         fwd_result = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -222,18 +215,16 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             scale=scale,
             initial_state=initial_state,
             output_final_state=output_final_state,
-            output_h=save_bwd_intermediates,
+            output_h=save_pure_bwd,
             cu_seqlens=cu_seqlens,
-            output_v_new=save_bwd_intermediates,
+            output_v_new=save_pure_bwd,
             transpose_state_layout=transpose_state_layout,
-            output_w=save_bwd_intermediates,
         )
-        if save_bwd_intermediates:
-            g, A, o, h, final_state, v_new, w = fwd_result
+        if save_pure_bwd:
+            g, A, o, h, final_state, v_new = fwd_result
         else:
             g, A, o, h, final_state = fwd_result
             v_new = None
-            w = None
 
         ctx.save_for_backward(
             q_orig,
@@ -246,7 +237,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens,
             h,
             v_new,
-            w,
         )
         ctx.scale = scale
         ctx.transpose_state_layout = transpose_state_layout
@@ -266,7 +256,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens,
             h,
             v_new,
-            w,
         ) = ctx.saved_tensors
 
         dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
@@ -284,7 +273,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             h=h,
             v_new=v_new,
             transpose_state_layout=ctx.transpose_state_layout,
-            w=w,
         )
 
         return (

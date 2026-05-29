@@ -1,24 +1,17 @@
 from .. import tilelang_compat as _tilelang_compat  # noqa: F401
 
-from .fused_bwd import (
-    fused_gdr_bwd,
-    is_fla2_bwd_available,
-    prepare_fla2_bwd_a,
-    prepare_fla2_bwd_w,
-)
+# sm12x is 100% pure TileLang. The forward (fused_fwd / kkt_solve / prepare_h /
+# cp_fwd) and the decomposed backward (bwd_sm12x.py) contain no FLA. The old
+# FLA-coupled fused_bwd.py was deleted, so it is no longer imported/exported.
 from .fused_fwd import fused_gdr_fwd
 from .kkt_solve import kkt_solve
 from .prepare_h import fused_gdr_h
 from .cp_fwd import get_warmup_chunks, correct_initial_states
 
 __all__ = [
-    "fused_gdr_bwd",
     "fused_gdr_fwd",
     "fused_gdr_h",
-    "is_fla2_bwd_available",
     "kkt_solve",
-    "prepare_fla2_bwd_a",
-    "prepare_fla2_bwd_w",
     "get_warmup_chunks",
     "correct_initial_states",
 ]
