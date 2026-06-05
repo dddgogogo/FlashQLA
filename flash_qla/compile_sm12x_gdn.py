@@ -127,16 +127,13 @@ def patch_tilelang_use_nvcc() -> None:
     NVRTC cannot compile warp-shuffle reductions (`tl::warp_reduce_sum`), which
     silently forced the slow shared-memory recurrent kernel (general
     `tilelang_flashqla_gdn_update`, 128-thread + per-step block barrier) to be
-    deployed instead of the warp-specialized kernel. nvcc compiles them. The
-    produced cubin loads via cuModuleLoadData identically.
+    deployed instead of the warp-specialized kernel. On CUDA 13.3, TileLang
+    0.1.9's NVRTC path also collides with CCCL's cuda::std tuple declarations in
+    the chunk kernels. nvcc compiles both cases. The produced cubin loads via
+    cuModuleLoadData identically.
 
-    Scope: this is installed ONLY by the recurrent compile entry points (the
-    warp kernel is the only kernel that needs nvcc). The chunk / chunk_bwd
-    kernels stay on the proven in-process NVRTC path so their finite-diff
-    numerical validation (and the cumsum kernel that deliberately omits
-    fast-math) is unchanged. Set FLASHQLA_COMPILE_BACKEND=nvrtc to skip the
-    patch (the warp kernel will then fail loudly under NVRTC rather than
-    silently degrade).
+    Set FLASHQLA_COMPILE_BACKEND=nvrtc to skip the patch for debugging; sm12x
+    production should keep the nvcc path.
     """
     if os.environ.get("FLASHQLA_COMPILE_BACKEND", "nvcc").lower() != "nvcc":
         return
@@ -999,9 +996,7 @@ def main() -> None:
     arch = require_sm12x()
     patch_tilelang_compat()
     patch_tilelang_nvrtc_scalar_params()
-    # NOTE: patch_tilelang_use_nvcc() is installed ONLY by the recurrent compile
-    # entry points (the warp kernel is the sole nvcc-requiring kernel) — NOT here
-    # globally — so chunk / chunk_bwd stay on the proven NVRTC path.
+    patch_tilelang_use_nvcc()
     print(f"Compiling FlashQLA GDN kernels for {arch} from {_ROOT}")
 
     base_cfg = {
