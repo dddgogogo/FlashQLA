@@ -5678,7 +5678,18 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
     cache_intermediate_states,
     has_tree_attention,
     block_DV: int = 32,
+    intermediate_dtype=None,
 ):
+    # Storage dtype of the per-step intermediate-state scratch
+    # (`intermediate_states_buffer`) only. `None` keeps the historical behavior
+    # (same dtype as `h0_source`, i.e. `state_dtype`). Passing torch.bfloat16
+    # halves the DFlash verify scratch VRAM: the recurrence still accumulates
+    # in `accum_dtype` (fp32) registers — only the per-step store (and the tree
+    # parent-hop reload) round-trips through bf16, mirroring the sglang verify
+    # kernel's `b_h.to(cache_ptr.dtype.element_ty)` semantics. The persistent
+    # recurrent pool (`h0_source`) keeps `state_dtype` unconditionally.
+    if intermediate_dtype is None:
+        intermediate_dtype = state_dtype
     total_tokens = T.dynamic("total_tokens")
     num_sequences = T.dynamic("num_sequences")
     cache_steps = T.dynamic("cache_steps")
@@ -5704,7 +5715,7 @@ def tilelang_flashqla_gdn_regular_bv32_warp(
         b: T.Tensor(b_shape, dtype=b_dtype),
         h0_source: T.Tensor(state_shape, dtype=state_dtype),
         h0_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
-        intermediate_states_buffer: T.Tensor(intermediate_shape, dtype=state_dtype),
+        intermediate_states_buffer: T.Tensor(intermediate_shape, dtype=intermediate_dtype),
         intermediate_state_indices: T.Tensor((num_sequences,), dtype=indices_dtype),
         retrieve_parent_token: T.Tensor((num_sequences, cache_steps), dtype=indices_dtype),
         o: T.Tensor(o_shape, dtype=o_dtype),
@@ -7375,6 +7386,10 @@ def fused_sigmoid_gating_delta_rule_update(
                 cache_intermediate_states=cache_intermediate,
                 has_tree_attention=has_tree,
                 block_DV=block_DV,
+                # Follow the caller's scratch dtype (bf16 verify-scratch
+                # support). The None-intermediate placeholders above are
+                # state-dtype, so this is a no-op for non-bf16 callers.
+                intermediate_dtype=intermediate.dtype,
             )
             kernel(
                 A_log_c,

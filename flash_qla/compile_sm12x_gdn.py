@@ -419,6 +419,7 @@ def compile_recurrent_update(
     cache_intermediate_states: bool,
     has_tree_attention: bool,
     block_dv: int,
+    intermediate_bf16: bool = False,
 ):
     import torch
 
@@ -471,6 +472,12 @@ def compile_recurrent_update(
         cache_intermediate_states=cache_intermediate_states,
         has_tree_attention=has_tree_attention,
         block_DV=block_dv,
+        # bf16 halves the DFlash verify intermediate-state scratch VRAM. Only
+        # the per-step scratch store (and tree parent-hop reload) narrows to
+        # bf16 — the recurrence accumulates fp32 in registers and `h0_source`
+        # (the persistent recurrent pool) stays f32. Decode never caches
+        # intermediates, so this is verify/verify_tree-only.
+        intermediate_dtype=torch.bfloat16 if intermediate_bf16 else None,
     )
 
 
@@ -841,14 +848,17 @@ def compile_chunk_bwd_entries(args: argparse.Namespace, base_cfg: dict[str, int]
     ]
 
 
-# (export, tokens_per_seq, disable_state_update, cache_intermediate, has_tree, block_dv)
+# (export, tokens_per_seq, disable_state_update, cache_intermediate, has_tree,
+#  block_dv, intermediate_bf16)
 # decode is single-token; verify/verify_tree process the fixed DFlash verify_q_len
 # rows. tokens_per_seq is baked into the warp cubin, so decode (always 1) and
 # verify (verify_q_len) MUST live in separate modules with separate identities —
 # a verify_tree compiled at tokens_per_seq=1 dead-code-eliminates retrieve_parent_token
 # and would fail the Rust ABI param check that aborts the whole module load.
+# intermediate_bf16 (--verify-scratch-dtype bf16) applies to the verify exports
+# only: decode never declares the intermediate buffer, so it is pinned False.
 def _recurrent_decode_export(_args: argparse.Namespace):
-    return (EXPORT_RECURRENT_DECODE, 1, False, False, False, 4)
+    return (EXPORT_RECURRENT_DECODE, 1, False, False, False, 4, False)
 
 
 def _recurrent_verify_exports(args: argparse.Namespace):
@@ -860,9 +870,10 @@ def _recurrent_verify_exports(args: argparse.Namespace):
             f"--verify-q-len must be >= 2 for the recurrent verify module "
             f"(got {args.verify_q_len}); decode uses the recurrent_decode module"
         )
+    intermediate_bf16 = args.verify_scratch_dtype == "bf16"
     return [
-        (EXPORT_RECURRENT_VERIFY, args.verify_q_len, True, True, False, 4),
-        (EXPORT_RECURRENT_VERIFY_TREE, args.verify_q_len, True, True, True, 4),
+        (EXPORT_RECURRENT_VERIFY, args.verify_q_len, True, True, False, 4, intermediate_bf16),
+        (EXPORT_RECURRENT_VERIFY_TREE, args.verify_q_len, True, True, True, 4, intermediate_bf16),
     ]
 
 
@@ -878,7 +889,15 @@ def _emit_recurrent_exports(args: argparse.Namespace, recurrent_exports):
         "V": args.head_v_dim,
     }
     entries = []
-    for export_name, tokens_per_seq, disable_state_update, cache_intermediate, has_tree, block_dv in recurrent_exports:
+    for (
+        export_name,
+        tokens_per_seq,
+        disable_state_update,
+        cache_intermediate,
+        has_tree,
+        block_dv,
+        intermediate_bf16,
+    ) in recurrent_exports:
         entries.append(
             export_tilelang_kernel(
                 args.output_dir,
@@ -893,6 +912,7 @@ def _emit_recurrent_exports(args: argparse.Namespace, recurrent_exports):
                     cache_intermediate_states=cache_intermediate,
                     has_tree_attention=has_tree,
                     block_dv=block_dv,
+                    intermediate_bf16=intermediate_bf16,
                 ),
                 config_kwargs={
                     **recurrent_base_cfg,
@@ -901,6 +921,12 @@ def _emit_recurrent_exports(args: argparse.Namespace, recurrent_exports):
                     "DISABLE_STATE_UPDATE": int(disable_state_update),
                     "CACHE_INTERMEDIATE": int(cache_intermediate),
                     "TREE": int(has_tree),
+                    # Baked scratch dtype of intermediate_states_buffer (0=f32,
+                    # 1=bf16). The Rust loader validates this against the
+                    # process's LING_DFLASH_VERIFY_SCRATCH_BF16 so a stale/
+                    # mismatched cubin cannot silently read the scratch at the
+                    # wrong element width.
+                    "INTERMEDIATE_BF16": int(intermediate_bf16),
                 },
             )
         )
@@ -947,6 +973,15 @@ def parse_args() -> argparse.Namespace:
     # kernel bakes tokens_per_seq at compile time, so verify/verify_tree cubins
     # are specialized to this; decode is always tokens_per_seq=1.
     parser.add_argument("--verify-q-len", type=int, default=17)
+    # Storage dtype of the verify/verify_tree per-step intermediate-state
+    # scratch (`intermediate_states_buffer`). bf16 halves the DFlash verify
+    # scratch VRAM; the recurrence still accumulates fp32 in registers and the
+    # persistent recurrent pool (`h0_source`) stays f32. Baked into the cubin
+    # (and the INTERMEDIATE_BF16 manifest config), so the Ling-RL runner keys
+    # its kernel cache on it. Decode is unaffected (no intermediate buffer).
+    parser.add_argument(
+        "--verify-scratch-dtype", choices=["f32", "bf16"], default="f32"
+    )
     # nvcc cubin arch (e.g. "sm_121a" / "sm_120f"). The Ling-RL kernel-jit runner
     # passes its own family-suffix-resolved arch so the recurrent warp cubin is
     # named/targeted exactly like the wrapper-compiled kernels. Absent => derive
